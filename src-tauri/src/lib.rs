@@ -42,15 +42,13 @@ pub fn run() {
             // 定时签到 + 池化网关：独立后台线程，与进程同生命周期
             scheduler::spawn(app.handle().clone());
             gateway::spawn_gateway(app.handle().clone());
-            // 启动自愈：若上次已开启「自动注入」且条目缺失，在 TraeWork 未运行时补注
+            // 启动自愈：若已开启「自动接管」且用户已添加网关模型，在 TraeWork 未运行时自动选中
             let heal_app = app.handle().clone();
             std::thread::spawn(move || {
                 for _ in 0..12 {
                     if let Ok(d) = commands::try_data_dir(&heal_app) {
                         let s = accounts::load_settings(&d);
-                        if s.injection_enabled && !crate::inject::is_trae_running() {
-                            let _ = crate::inject::self_heal(true, s.gateway_port);
-                        }
+                        let _ = crate::inject::self_heal(s.injection_enabled, s.gateway_port);
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -72,8 +70,6 @@ pub fn run() {
             commands::list_accounts,
             commands::import_accounts,
             commands::remove_account,
-            commands::import_from_file,
-            commands::add_manual_account,
             commands::discover_local,
             commands::toggle_account,
             commands::checkin_one,
@@ -87,9 +83,9 @@ pub fn run() {
             commands::oauth_start,
             commands::oauth_poll,
             commands::open_external,
-            commands::inject_model,
-            commands::injection_status,
-            commands::revert_injection,
+            commands::takeover_model,
+            commands::takeover_status,
+            commands::release_takeover,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

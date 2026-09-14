@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import {
   getGatewayStatus,
-  injectModel,
-  getInjectionStatus,
-  revertInjection,
+  takeoverModel,
+  getTakeoverStatus,
+  releaseTakeover,
 } from "../api";
-import type { GatewayStatus, InjectionStatus, Settings } from "../types";
+import type { GatewayStatus, TakeoverStatus, Settings } from "../types";
 
 interface Props {
   settings: Settings | null;
@@ -15,7 +15,7 @@ interface Props {
 export default function GatewayPage({ settings, update }: Props) {
   const port = settings?.gateway_port ?? 8788;
   const [status, setStatus] = useState<GatewayStatus | null>(null);
-  const [inj, setInj] = useState<InjectionStatus | null>(null);
+  const [inj, setInj] = useState<TakeoverStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
 
@@ -33,9 +33,9 @@ export default function GatewayPage({ settings, update }: Props) {
     };
   }, []);
 
-  // 注入状态加载
+  // 接管状态加载
   const loadInj = () => {
-    getInjectionStatus().then(setInj).catch(() => {});
+    getTakeoverStatus().then(setInj).catch(() => {});
   };
   useEffect(() => {
     loadInj();
@@ -54,32 +54,32 @@ export default function GatewayPage({ settings, update }: Props) {
     text = "网关未启用（勾选上方开关后自动启动）";
   }
 
-  const onInject = async () => {
-    setBusy(true);
-    setNote(null);
-    try {
-      const r = await injectModel();
-      if (r.needs_quit) {
-        setNote(`⚠ ${r.message}`);
-      } else {
-        setNote(`✔ ${r.message}`);
-        update({ injection_enabled: true });
-        loadInj();
-      }
-    } catch (e) {
-      setNote(`✖ ${e}`);
-    } finally {
-      setBusy(false);
-    }
-  };
+  const matched = !!inj?.matched;
+  const baseUrl = inj?.base_url ?? `http://127.0.0.1:${port}/v1/chat/completions`;
+  const selectedCount = (inj?.entries ?? []).filter((e) => e.selected).length;
+  const entryCount = (inj?.entries ?? []).length;
 
-  const onRevert = async () => {
+  // 开启智能接管 → 自动选中你已添加的网关模型；关闭 → 仅清空选中，绝不删你的模型。
+  const onToggleGateway = async (checked: boolean) => {
     setBusy(true);
     setNote(null);
     try {
-      const n = await revertInjection();
-      setNote(`✔ 已还原 ${n} 个 state.vscdb 为注入前状态。`);
-      update({ injection_enabled: false });
+      update({ gateway_enabled: checked });
+      if (checked) {
+        const r = await takeoverModel();
+        if (r.matched) {
+          setNote(`✔ ${r.message}`);
+        } else {
+          setNote(`⚠ ${r.message}`);
+        }
+      } else {
+        const n = await releaseTakeover();
+        setNote(
+          n > 0
+            ? `✔ 已清空 ${n} 个 state.vscdb 的网关选中（你的自定义模型保留不变）。`
+            : "✔ 已关闭本地网关。",
+        );
+      }
       loadInj();
     } catch (e) {
       setNote(`✖ ${e}`);
@@ -88,22 +88,21 @@ export default function GatewayPage({ settings, update }: Props) {
     }
   };
 
-  const injected = (inj?.entries ?? []).flatMap((e) => e.labels);
-  const hasInjection = injected.length > 0;
-
   return (
     <section className="card">
       <h2>智能接管（池化网关）</h2>
       <p className="muted" style={{ marginTop: 0 }}>
-        <b>一键注入</b>：帮你在 TraeWork 内置模型里注入「TraePool · 账号池」，无需手动添加自定义模型。
-        选中它后，聊天请求经本地网关按账号池自动选号、会话粘滞，遇限流无感切换。
+        本助手<b>不替你写模型进 TraeWork</b>（SOLO CN 的模型列表由服务端权威下发，本地写入约 2
+        秒即被覆盖、永不可见）。正确链路是：<b>你先在 TraeWork 手动添加一次</b>指向本机网关的自定义模型，
+        本助手负责<b>启停网关 + 自动选中</b>它。聊天请求经本地网关按账号池自动选号、会话粘滞，遇限流无感切换。
       </p>
       <div className="row">
         <label>
           <input
             type="checkbox"
             checked={!!settings?.gateway_enabled}
-            onChange={(e) => update({ gateway_enabled: e.target.checked })}
+            disabled={busy}
+            onChange={(e) => onToggleGateway(e.target.checked)}
           />{" "}
           开启本地网关
         </label>
@@ -117,31 +116,53 @@ export default function GatewayPage({ settings, update }: Props) {
         <span className={`tag ${tag}`}>{text}</span>
       </div>
 
-      <h3>内置模型注入</h3>
+      <h3>第一步：在 TraeWork 添加自定义模型（只需一次）</h3>
       <p className="muted">
-        写入 TraeWork 的 <code>state.vscdb</code> 需在 <b>TraeWork 关闭时</b>进行
-        （运行时写入会在退出时被覆盖）。若 TraeWork 正在运行，点击会提示先退出。
+        打开 TraeWork：<code>设置 → 模型 → 添加自定义模型（OpenAI 兼容）</code>，
+        Base URL 填下面这个地址并保存。保存后它会出现在模型列表里（服务端注册、持久）。
       </p>
-      <div className="row" style={{ gap: 8 }}>
-        <button onClick={onInject} disabled={busy}>
-          {busy ? "处理中…" : hasInjection ? "重新注入" : "一键注入内置模型"}
-        </button>
-        {hasInjection && (
-          <button onClick={onRevert} disabled={busy} style={{ color: "var(--danger, #d93026)" }}>
-            还原为注入前
-          </button>
-        )}
-        {inj?.trae_running && <span className="tag bad">TraeWork 运行中</span>}
-        {hasInjection && !inj?.trae_running && <span className="tag ok">已注入 {injected.length} 个入口</span>}
-        {!hasInjection && !inj?.trae_running && <span className="tag off">未注入</span>}
+      <div className="row">
+        <code
+          style={{
+            background: "var(--bg-soft, #f3f3f5)",
+            padding: "4px 8px",
+            borderRadius: 6,
+          }}
+        >
+          {baseUrl}
+        </code>
       </div>
-      {note && <p className="muted" style={{ marginTop: 8 }}>{note}</p>}
-      {hasInjection && (
+
+      <h3>第二步：开启上方开关，助手自动选中</h3>
+      <div className="row" style={{ gap: 8 }}>
+        {inj?.trae_running && <span className="tag bad">TraeWork 运行中</span>}
+        {matched && entryCount > 0 && (
+          <span className="tag ok">
+            已匹配 {entryCount} 个入口
+            {selectedCount === entryCount
+              ? "，全部已选中"
+              : `，${selectedCount} 个已选中`}
+          </span>
+        )}
+        {!matched && !inj?.trae_running && (
+          <span className="tag off">未检测到自定义模型</span>
+        )}
+        {!matched && inj?.trae_running && (
+          <span className="tag off">请先添加自定义模型</span>
+        )}
+        {busy && <span className="tag off">处理中…</span>}
+      </div>
+      {matched && (
         <p className="muted" style={{ marginTop: 4 }}>
-          重启 TraeWork 后，在模型选择器选「TraePool · 账号池」即可走账号池。
-          目标：{inj?.entries[0]?.base_url}
+          目标：{baseUrl}。开启开关后，重启 TraeWork 即可在模型选择器看到该模型为已选中。
         </p>
       )}
+      {!matched && (
+        <p className="muted" style={{ marginTop: 4 }}>
+          尚未检测到指向该地址的自定义模型。先按第一步添加并保存，再开启上方开关，助手会自动选中它。
+        </p>
+      )}
+      {note && <p className="muted" style={{ marginTop: 8 }}>{note}</p>}
     </section>
   );
 }

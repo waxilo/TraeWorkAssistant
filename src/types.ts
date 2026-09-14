@@ -79,22 +79,26 @@ export interface OAuthPoll {
   error?: string | null;
 }
 
-export interface InjectOutcome {
-  needs_quit: boolean;
+export interface TakeoverOutcome {
   restarted: boolean;
-  injected_db_count: number;
+  matched: boolean;
   labels: string[];
+  base_url: string;
   message: string;
 }
 
-export interface InjectionEntry {
+export interface TakeoverEntry {
   db: string;
   key: string;
-  labels: string[];
+  label: string;
+  name: string;
   base_url: string;
+  selected: boolean;
 }
 
-export interface InjectionStatus {
+export interface TakeoverStatus {
   trae_running: boolean;
-  entries: InjectionEntry[];
+  matched: boolean;
+  base_url: string;
+  entries: TakeoverEntry[];
 }

@@ -213,11 +213,6 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
     })
 }
 
-/// 从**指定的** storage.json 文件解析登录态（用于「导入外部登录态」）。失败返回 None。
-pub fn parse_local_account(path: &std::path::Path) -> Option<TraeLocalAccount> {
-    parse_storage(path)
-}
-
 /// 扫描本机 TraeWork 登录态，返回可导入的账号列表。
 /// 一个 storage.json 只有一个当前登录态，但不同安装/不同 user-data 目录可能各自持有一个。
 pub fn discover_local_accounts() -> Vec<TraeLocalAccount> {

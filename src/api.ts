@@ -8,8 +8,8 @@ import type {
   AcctStatus,
   OAuthStart,
   OAuthPoll,
-  InjectOutcome,
-  InjectionStatus,
+  TakeoverOutcome,
+  TakeoverStatus,
 } from "./types";
 
 export const listAccounts = () => invoke<Account[]>("list_accounts");
@@ -35,13 +35,6 @@ export const getSettings = () => invoke<Settings>("get_settings");
 export const getGatewayStatus = () => invoke<GatewayStatus>("gateway_status");
 export const saveSettings = (settings: Settings) =>
   invoke<Settings>("save_settings", { settings });
-export const importFromFile = (path: string) => invoke<Account[]>("import_from_file", { path });
-export const addManualAccount = (o: {
-  name?: string;
-  host?: string;
-  token: string;
-  region?: string;
-}) => invoke<Account[]>("add_manual_account", o);
 export const getLogs = () => invoke<LogEntry[]>("get_logs");
 export const clearLogs = () => invoke<void>("clear_logs");
 export const oauthStart = (host?: string | null) =>
@@ -50,6 +43,6 @@ export const oauthPoll = (loginId: string) =>
   invoke<OAuthPoll>("oauth_poll", { loginId });
 export const openExternal = (url: string) => invoke<void>("open_external", { url });
 
-export const injectModel = () => invoke<InjectOutcome>("inject_model");
-export const getInjectionStatus = () => invoke<InjectionStatus>("injection_status");
-export const revertInjection = () => invoke<number>("revert_injection");
+export const takeoverModel = () => invoke<TakeoverOutcome>("takeover_model");
+export const getTakeoverStatus = () => invoke<TakeoverStatus>("takeover_status");
+export const releaseTakeover = () => invoke<number>("release_takeover");

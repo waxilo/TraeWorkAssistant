@@ -9,8 +9,6 @@
 //! host 由账号数据里的 `host` 决定（如 `https://api.trae.cn`）。
 
 use crate::accounts::Account;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use regex::Regex;
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -215,7 +213,6 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
     for path in CLAIM_PATHS {
         let url = format!("{}{}", host, path);
         let mut attempt = 0usize;
-        let mut path_last: Option<String> = None;
         loop {
             attempt += 1;
             let mut req = client
@@ -272,16 +269,15 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
-                    path_last = Some(format!("[HTTP {} code={:?}] {}", status.as_u16(), code, msg));
+                    last = Some(format!("[HTTP {} code={:?}] {}", status.as_u16(), code, msg));
                     break;
                 }
                 Err(e) => {
-                    path_last = Some(format!("{} 请求失败：{}", url, e));
+                    last = Some(format!("{} 请求失败：{}", url, e));
                     break;
                 }
             }
         }
-        last = path_last;
     }
 
     CheckinResult {
@@ -320,51 +316,6 @@ pub async fn query_status(account: &Account) -> Option<Value> {
     None
 }
 
-/// 查询签到状态的结构化视图（给定时/汇总用）。
-pub struct CheckinStatus {
-    pub checked_in: bool,
-    pub enable: bool,
-    pub credits: Option<i64>,
-    pub message: String,
-}
-
-impl CheckinStatus {
-    pub fn from_status(v: Option<Value>) -> Option<CheckinStatus> {
-        let v = v?;
-        let (checked_in, enable, credits) = status_fields(&v);
-        let message = v
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("success")
-            .to_string();
-        Some(CheckinStatus {
-            checked_in,
-            enable,
-            credits,
-            message,
-        })
-    }
-}
-
-/// 从 JWT 的 iss/host 推断 API host（备用；账号数据里一般已有 host）
-pub fn issuer_host(token: &str) -> Option<String> {
-    let part = token.split('.').nth(1)?;
-    let mut padded = part.replace('-', "+").replace('_', "/");
-    while padded.len() % 4 != 0 {
-        padded.push('=');
-    }
-    let bytes = STANDARD.decode(padded).ok()?;
-    let payload: Value = serde_json::from_slice(&bytes).ok()?;
-    let iss = payload.get("iss")?.as_str()?;
-    if iss.contains("api.trae.cn") {
-        Some("https://api.trae.cn".into())
-    } else if iss.contains("api.trae.ai") {
-        Some("https://api.trae.ai".into())
-    } else {
-        Some(iss.trim_end_matches('/').to_string())
-    }
-}
-
 #[cfg(test)]
 mod real_tests {
     use super::*;
@@ -399,12 +350,7 @@ mod real_tests {
             println!("accounts={}", list.len());
             for a in list {
                 let acc = to_account(&a);
-                let st = CheckinStatus::from_status(query_status(&acc).await);
-                println!("STATUS checked_in={:?} enable={:?} credits={:?} msg={:?}",
-                    st.as_ref().map(|s| s.checked_in),
-                    st.as_ref().map(|s| s.enable),
-                    st.as_ref().and_then(|s| s.credits),
-                    st.as_ref().map(|s| s.message.clone()));
+                let _status = query_status(&acc).await;
                 let r = do_checkin(&acc).await;
                 println!("CHECKIN success={} already={} inactive={} credit={:?} msg={:?}",
                     r.success, r.already, r.inactive, r.credit, r.message);

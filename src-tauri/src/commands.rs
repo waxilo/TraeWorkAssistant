@@ -24,13 +24,6 @@ fn settings(app: &tauri::AppHandle) -> Settings {
     }
 }
 
-/// 账号的 API host（账号数据优先，否则默认 api.trae.cn）
-pub fn account_host(a: &Account) -> String {
-    a.host
-        .clone()
-        .unwrap_or_else(|| "https://api.trae.cn".into())
-}
-
 // ---------------------------------------------------------------------------
 // 账号
 // ---------------------------------------------------------------------------
@@ -45,12 +38,11 @@ pub fn import_accounts(app: tauri::AppHandle, accounts: Vec<Account>) -> Result<
     let dir = try_data_dir(&app)?;
     let mut list = accounts::load_accounts(&dir);
     for a in accounts {
-        // 按 token 去重；已存在则更新
-        if let Some(existing) = list.iter_mut().find(|x| x.token == a.token) {
-            *existing = a;
-        } else {
-            list.push(a);
+        // 按手机号（优先）或 token 去重；已存在则不重复添加
+        if accounts::contains_equivalent(&list, &a) {
+            continue;
         }
+        list.push(a);
     }
     accounts::save_accounts(&dir, &list)?;
     Ok(list)
@@ -65,76 +57,15 @@ pub fn remove_account(app: tauri::AppHandle, id: String) -> Result<Vec<Account>,
     Ok(kept)
 }
 
-/// 从指定的登录态文件（storage.json）导入账号（用于「添加新账号 → 导入外部登录态」）。
-#[tauri::command]
-pub fn import_from_file(app: tauri::AppHandle, path: String) -> Result<Vec<Account>, String> {
-    let dir = try_data_dir(&app)?;
-    let mut list = accounts::load_accounts(&dir);
-    if let Some(tla) = trae_auth::parse_local_account(&std::path::Path::new(&path)) {
-        let a: Account = tla.into();
-        if let Some(existing) = list.iter_mut().find(|x| x.token == a.token) {
-            *existing = a;
-        } else {
-            list.push(a);
-        }
-        accounts::save_accounts(&dir, &list)?;
-        Ok(list)
-    } else {
-        Err("无法解析该登录态文件：不是有效的 TraeWork storage.json，或文件已失效".into())
-    }
-}
-
-/// 手动添加账号：粘贴 token（+ host/name/region），不依赖本机安装。
-#[tauri::command]
-pub fn add_manual_account(
-    app: tauri::AppHandle,
-    name: Option<String>,
-    host: Option<String>,
-    token: String,
-    region: Option<String>,
-) -> Result<Vec<Account>, String> {
-    if token.trim().len() < 40 {
-        return Err("token 过短，请粘贴完整的登录令牌".into());
-    }
-    let dir = try_data_dir(&app)?;
-    let mut list = accounts::load_accounts(&dir);
-    let account = Account {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| "手动导入账号".into()),
-        phone: None,
-        region,
-        user_id: None,
-        token: token.trim().to_string(),
-        refresh_token: None,
-        host: host.filter(|h| !h.trim().is_empty()),
-        expires_at: None,
-        refresh_expires_at: None,
-        device_id: None,
-        machine_id: None,
-        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        enabled: true,
-    };
-    if let Some(existing) = list.iter_mut().find(|x| x.token == account.token) {
-        *existing = account;
-    } else {
-        list.push(account);
-    }
-    accounts::save_accounts(&dir, &list)?;
-    Ok(list)
-}
-
 /// 扫描本机 TraeWork 已登录账号，返回「可导入」列表（不含已在库里的）。
 #[tauri::command]
 pub fn discover_local(app: tauri::AppHandle) -> Result<Vec<Account>, String> {
     let dir = try_data_dir(&app)?;
-    let existing_tokens: Vec<String> =
-        accounts::load_accounts(&dir).iter().map(|a| a.token.clone()).collect();
+    let existing = accounts::load_accounts(&dir);
     Ok(trae_auth::discover_local_accounts()
         .into_iter()
         .map(Account::from)
-        .filter(|a| !existing_tokens.contains(&a.token))
+        .filter(|a| !accounts::contains_equivalent(&existing, a))
         .collect())
 }
 
@@ -260,63 +191,90 @@ pub fn open_external(url: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 内置模型自动注入（写 state.vscdb → 本地池化网关）
+// 池化网关「自动接管」（用户已手动添加自定义模型 + 助手自动选中）
 // ---------------------------------------------------------------------------
 
-/// 注入结果。`restarted` 表示本次是否自动退出了 TraeWork 后再写入并重启。
+/// 接管结果。`matched=false` 表示本机尚未检测到用户添加的网关模型（需用户先手动添加）。
 #[derive(serde::Serialize, Clone)]
-pub struct InjectOutcome {
-    pub needs_quit: bool,
+pub struct TakeoverOutcome {
+    /// 本次是否自动退出了 TraeWork 后再写入选中并重启。
     pub restarted: bool,
-    pub injected_db_count: usize,
+    /// 本机是否已有指向网关的自定义模型（用户是否已手动添加）。
+    pub matched: bool,
+    /// 被自动选中的 agent 入口列表。
     pub labels: Vec<String>,
+    /// 本机网关地址（即用户需填的 Base URL）。
+    pub base_url: String,
     pub message: String,
 }
 
-/// 自动注入「自定义模型」条目到各登录态 state.vscdb 并切选中模型。
-/// 若检测到 TraeWork 运行中，会**自动退出 → 写入（关闭窗口，避免被覆盖）→ 再启动**。
+/// 自动接管：把用户已添加的网关模型选为各 agent 入口的当前模型。
+///
+/// 先做一次**只读**预检（即便 TraeWork 运行中也能判断用户是否已添加）；若已添加，
+/// 则在「TraeWork 未运行时」写入选中记录（必要时自动退出 → 写入 → 重启）。
+/// 若用户尚未在 TraeWork 添加自定义模型，返回 `matched=false` 与引导文案，不报错。
 #[tauri::command]
-pub fn inject_model(app: tauri::AppHandle) -> Result<InjectOutcome, String> {
+pub fn takeover_model(app: tauri::AppHandle) -> Result<TakeoverOutcome, String> {
     let dir = try_data_dir(&app)?;
     let port = settings(&app).gateway_port;
-    let (labels, restarted) = crate::inject::with_trae_restart(|| crate::inject::inject_all(port))?;
-    // 记录注入状态，供启动自愈
+    let base_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // 只读预检：用户是否已添加指向本机网关的自定义模型
+    let matched_models = crate::inject::find_gateway_models(port);
     let mut settings = settings(&app);
+    if matched_models.is_empty() {
+        // 未添加：保留偏好（下次添加后自动生效），返回引导文案
+        settings.injection_enabled = true;
+        accounts::save_settings(&dir, &settings)?;
+        return Ok(TakeoverOutcome {
+            restarted: false,
+            matched: false,
+            labels: vec![],
+            base_url: base_url.clone(),
+            message: format!(
+                "未在 TraeWork 检测到指向本机网关的自定义模型（Base URL 应为 {base_url}）。请先：\
+                 TraeWork 设置 → 模型 → 添加自定义模型（OpenAI 兼容），Base URL 填上面的地址并保存；\
+                 之后重新开启本开关，助手会自动选中它。"
+            ),
+        });
+    }
+    // 已添加：在 TraeWork 未运行时写入选中（必要时自动退出 → 写入 → 重启）
+    let (res, restarted) =
+        crate::inject::with_trae_restart(|| crate::inject::select_gateway_model(port))?;
+    let (_count, labels) = res;
     settings.injection_enabled = true;
     accounts::save_settings(&dir, &settings)?;
-    Ok(InjectOutcome {
-        needs_quit: false,
+    Ok(TakeoverOutcome {
         restarted,
-        injected_db_count: labels,
-        labels: crate::inject::injection_status(port)
-            .into_iter()
-            .flat_map(|i| i.labels)
-            .collect(),
+        matched: true,
+        labels: labels.clone(),
+        base_url: base_url.clone(),
         message: format!(
-            "已向 {} 个 state.vscdb 注入「{}」并切为选中模型。{}",
-            labels,
-            crate::inject::INJECT_DISPLAY_NAME,
-            if restarted { "已自动退出并重启 TraeWork。" } else { "仅需重启 TraeWork 即可使用。" }
+            "已为 {} 个 agent 入口自动选中你添加的网关模型（{}）。{}",
+            labels.len(),
+            base_url,
+            if restarted {
+                "已自动退出并重启 TraeWork，重新打开即可见为已选中。"
+            } else {
+                "重启 TraeWork 后，在模型选择器即可见为已选中。"
+            }
         ),
     })
 }
 
-/// 当前注入状态 + TraeWork 运行态。
+/// 当前接管状态 + TraeWork 运行态。
 #[tauri::command]
-pub fn injection_status() -> serde_json::Value {
+pub fn takeover_status() -> crate::inject::TakeoverStatus {
     let port = crate::gateway::status().port;
-    serde_json::json!({
-        "trae_running": crate::inject::is_trae_running(),
-        "entries": crate::inject::injection_status(port),
-    })
+    crate::inject::takeover_status(port)
 }
 
-/// 还原所有 state.vscdb 到注入前备份。
-/// 若检测到 TraeWork 运行中，会**自动退出 → 还原 → 再启动**。
+/// 解除接管：仅清空助手写入的「网关模型选中」，绝不删除用户自己的自定义模型。
+/// 若检测到 TraeWork 运行中，会**自动退出 → 清空选中 → 再启动**。
 #[tauri::command]
-pub fn revert_injection(app: tauri::AppHandle) -> Result<usize, String> {
-    let (n, _restarted) = crate::inject::with_trae_restart(crate::inject::revert_all)?;
+pub fn release_takeover(app: tauri::AppHandle) -> Result<usize, String> {
     let dir = try_data_dir(&app)?;
+    let port = settings(&app).gateway_port;
+    let (n, _restarted) = crate::inject::with_trae_restart(|| crate::inject::clear_gateway_selection(port))?;
     let mut settings = settings(&app);
     settings.injection_enabled = false;
     accounts::save_settings(&dir, &settings)?;

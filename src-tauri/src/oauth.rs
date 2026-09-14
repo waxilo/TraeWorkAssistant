@@ -42,8 +42,6 @@ use rand::rngs::OsRng;
 
 /// SOLO 精简版消费端 client_id（逆向自 main.js `Fb()`）
 const CLIENT_ID_SOLO: &str = "en1oxy7wnw8j9n";
-/// TRAE 消费端 client_id
-const CLIENT_ID_TRAE: &str = "ono9krqynydwx5";
 /// 授权码换 token
 const EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
 /// 拉账号信息
@@ -156,10 +154,6 @@ fn hosts(input: Option<&str>) -> (String, String, String) {
             "cn".to_string(),
         )
     }
-}
-
-pub fn normalize_host(input: Option<&str>) -> String {
-    hosts(input).0
 }
 
 fn region_for_host(host: &str) -> Option<String> {
@@ -743,8 +737,6 @@ mod tests {
 
     #[test]
     fn host_selection_cn_vs_intl() {
-        assert_eq!(normalize_host(None), "https://api.trae.cn");
-        assert_eq!(normalize_host(Some("https://www.trae.cn")), "https://api.trae.cn");
         let (api, sso, region) = hosts(Some("https://api.trae.ai"));
         assert_eq!(api, "https://api.trae.ai");
         assert_eq!(sso, "https://www.trae.ai");

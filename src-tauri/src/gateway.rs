@@ -363,7 +363,6 @@ fn handle_conn(mut stream: TcpStream, app: tauri::AppHandle) {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let settings = accounts::load_settings(&dir);
     let mut ban: Vec<String> = Vec::new();
     let mut route_started = false;
     loop {
@@ -470,7 +469,7 @@ fn stream_response(stream: &mut TcpStream, mut resp: reqwest::Response) {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let mut headers: Vec<(&str, &str)> = Vec::new();
+    let headers: Vec<(&str, &str)> = Vec::new();
     if write_head(stream, status, &ctype, &headers).is_err() {
         return;
     }

@@ -8,14 +8,6 @@ use crate::accounts::Account;
 use serde_json::Value;
 use std::time::Duration;
 
-/// 续签阈值：剩余不足 48 小时就续一次
-pub const REFRESH_THRESHOLD_MS: i64 = 48 * 60 * 60 * 1000;
-
-/// 是否值得续签
-pub fn should_refresh(expires_at: Option<i64>, now_ms: i64) -> bool {
-    matches!(expires_at, Some(e) if e - now_ms < REFRESH_THRESHOLD_MS)
-}
-
 const REFRESH_PATHS: &[&str] = &[
     "/trae/api/v2/user/refresh_token",
     "/trae/api/v1/user/refresh_token",

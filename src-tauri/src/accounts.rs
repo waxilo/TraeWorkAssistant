@@ -30,14 +30,13 @@ pub struct Account {
     pub enabled: bool,
 }
 
-impl Account {
-    /// 判断 access token 是否已过期（未知有效期认为未过期）
-    pub fn expired(&self) -> bool {
-        match self.expires_at {
-            Some(e) => e <= chrono::Utc::now().timestamp_millis(),
-            None => false,
-        }
-    }
+/// 判定候选账号是否已存在于列表：手机号优先（两端都有且相等即视为同一人），
+/// 否则（任一缺少手机号）退化为按 token 比对。用于「按手机号去重、已存在则不重复添加」。
+pub fn contains_equivalent(list: &[Account], cand: &Account) -> bool {
+    list.iter().any(|x| match (&x.phone, &cand.phone) {
+        (Some(p1), Some(p2)) => p1 == p2,
+        _ => x.token == cand.token,
+    })
 }
 
 impl From<TraeLocalAccount> for Account {

@@ -10,18 +10,6 @@ impl Notifier {
     pub fn new() -> Self {
         Self {}
     }
-
-    pub fn info(&self, title: &str, message: &str) {
-        let _ = (title, message);
-        #[cfg(debug_assertions)]
-        eprintln!("[notify] {title}: {message}");
-    }
-
-    pub fn warn(&self, title: &str, message: &str) {
-        let _ = (title, message);
-        #[cfg(debug_assertions)]
-        eprintln!("[notify/warn] {title}: {message}");
-    }
 }
 
 // ---------------------------------------------------------------------------
