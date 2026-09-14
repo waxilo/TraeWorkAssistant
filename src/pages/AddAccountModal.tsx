@@ -117,6 +117,8 @@ export default function AddAccountModal({ onClose, onImported, notify, setStatus
             host: p.host ?? null,
             expires_at: p.expires_at ?? null,
             refresh_expires_at: null,
+            device_id: p.device_id ?? null,
+            machine_id: p.machine_id ?? null,
             created_at: new Date().toISOString(),
             enabled: true,
           };

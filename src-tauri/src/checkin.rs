@@ -58,19 +58,62 @@ fn normalize_host(url: &str) -> String {
     }
 }
 
-/// 请求头：鉴权用 `Cloud-IDE-JWT`，并带上 `X-User-Region`（缺省会导致 claim 报 9004）
+/// 设备/机器标识：优先用账号存的，否则用 user_id，再否则用 id 派生稳定值
+/// （保证同一账号每次请求一致；Trae 签到接口把设备头当必填项，缺则 9004 参数错误）。
+fn device_ids(account: &Account) -> (String, String) {
+    let dev = account
+        .device_id
+        .clone()
+        .or_else(|| account.user_id.clone())
+        .unwrap_or_else(|| account.id.clone());
+    let mach = account
+        .machine_id
+        .clone()
+        .or_else(|| account.user_id.clone())
+        .unwrap_or_else(|| account.id.clone());
+    (dev, mach)
+}
+
+/// 请求头：鉴权用 `Cloud-IDE-JWT`，并带齐签到接口必填头。
+///
+/// - `X-Device-Id` / `X-Machine-Id`：设备标识，缺省会导致 claim/status 报 **9004 参数错误**
+///   （即 "The submitted order parameters are incorrect"）；
+/// - `X-User-Region`：区域，缺失也会被部分端点判为参数错误；
+/// - `X-User-Id`：用户标识（社区实践表明补充后更稳）。
 fn headers(account: &Account) -> (String, Vec<(String, String)>) {
+    let (dev, mach) = device_ids(account);
     let mut hdrs: Vec<(String, String)> = vec![
         ("Content-Type".into(), "application/json".into()),
         ("Accept".into(), "application/json".into()),
+        ("X-Device-Id".into(), dev),
+        ("X-Machine-Id".into(), mach),
     ];
     if let Some(r) = &account.region {
         hdrs.push(("X-User-Region".into(), r.clone()));
+    }
+    if let Some(u) = &account.user_id {
+        if !u.is_empty() {
+            hdrs.push(("X-User-Id".into(), u.clone()));
+        }
     }
     (
         format!("Cloud-IDE-JWT {}", account.token),
         hdrs,
     )
+}
+
+/// 是否可重试的瞬时失败（服务器繁忙/限流，社区已知 code 9074）。
+fn is_transient_busy(code: Option<i64>, msg: &str) -> bool {
+    if code == Some(9074) {
+        return true;
+    }
+    let m = msg.to_ascii_lowercase();
+    m.contains("9074")
+        || m.contains("繁忙")
+        || m.contains("busy")
+        || m.contains("too many")
+        || m.contains("rate limit")
+        || m.contains("participants")
 }
 
 /// 从 status 响应取值：`checked_in`（今日是否已签）、`enable`、`credits`
@@ -167,58 +210,78 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
         }
     }
 
-    // 未命中明确状态，直接尝试领取
+    // 未命中明确状态，直接尝试领取（每个候选路径做有限重试，应对 9074 限流）
+    const MAX_CLAIM_ATTEMPTS: usize = 3;
     for path in CLAIM_PATHS {
         let url = format!("{}{}", host, path);
-        let mut req = client
-            .post(&url)
-            .header("Authorization", &auth_hdr)
-            .body("{}")
-            .timeout(Duration::from_secs(20));
-        for (k, v) in &hdrs {
-            req = req.header(k, v);
-        }
-        let resp = req.send().await;
-        match resp {
-            Ok(r) => {
-                let status = r.status();
-                let http_ok = status.is_success();
-                let text = r.text().await.unwrap_or_default();
-                let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                let code = body.get("code").and_then(Value::as_i64);
-                let mut msg = body
-                    .get("msg")
-                    .or_else(|| body.get("message"))
-                    .or_else(|| body.get("error"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if msg.is_empty() {
-                    msg = if text.trim().is_empty() {
-                        format!("返回体为空（HTTP {})", status.as_u16())
+        let mut attempt = 0usize;
+        let mut path_last: Option<String> = None;
+        loop {
+            attempt += 1;
+            let mut req = client
+                .post(&url)
+                .header("Authorization", &auth_hdr)
+                .body("{}")
+                .timeout(Duration::from_secs(20));
+            for (k, v) in &hdrs {
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let status = r.status();
+                    let http_ok = status.is_success();
+                    let text = r.text().await.unwrap_or_default();
+                    let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    let code = body.get("code").and_then(Value::as_i64);
+                    let mut msg = body
+                        .get("msg")
+                        .or_else(|| body.get("message"))
+                        .or_else(|| body.get("error"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    // 诊断兜底：把 HTTP 状态码 + 业务 code + 原始响应体带进消息，避免下次再盲猜
+                    let detail = if text.trim().is_empty() {
+                        format!("HTTP {}", status.as_u16())
                     } else {
-                        format!("HTTP {} ({})", status.as_u16(), text.trim().chars().take(120).collect::<String>())
+                        format!(
+                            "HTTP {} code={:?} {}",
+                            status.as_u16(),
+                            code,
+                            text.trim().chars().take(160).collect::<String>()
+                        )
                     };
+                    if msg.is_empty() {
+                        msg = detail.clone();
+                    }
+                    let (ok, already, inactive) = classify(http_ok, code, &msg);
+                    if ok || already || inactive || code == Some(0) {
+                        return CheckinResult {
+                            success: ok || code == Some(0),
+                            already,
+                            inactive,
+                            message: msg,
+                            credit: parse_credit(&body),
+                            host: Some(host.clone()),
+                            at: now,
+                        };
+                    }
+                    // 限流/繁忙：退避后重试（同路径），其余失败直接换下一路径
+                    if is_transient_busy(code, &msg) && attempt < MAX_CLAIM_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    path_last = Some(format!("[HTTP {} code={:?}] {}", status.as_u16(), code, msg));
+                    break;
                 }
-                let (ok, already, inactive) = classify(http_ok, code, &msg);
-                if ok || already || inactive || code == Some(0) {
-                    return CheckinResult {
-                        success: ok || code == Some(0),
-                        already,
-                        inactive,
-                        message: msg,
-                        credit: parse_credit(&body),
-                        host: Some(host.clone()),
-                        at: now,
-                    };
+                Err(e) => {
+                    path_last = Some(format!("{} 请求失败：{}", url, e));
+                    break;
                 }
-                last = Some(msg);
-            }
-            Err(e) => {
-                last = Some(format!("{} 请求失败：{}", url, e));
             }
         }
+        last = path_last;
     }
 
     CheckinResult {
@@ -320,6 +383,8 @@ mod real_tests {
             host: a.host.clone(),
             expires_at: a.expires_at,
             refresh_expires_at: a.refresh_expires_at,
+            device_id: a.device_id.clone(),
+            machine_id: a.machine_id.clone(),
             created_at: String::new(),
             enabled: true,
         }

@@ -19,6 +19,12 @@ pub struct Account {
     pub host: Option<String>,
     pub expires_at: Option<i64>,
     pub refresh_expires_at: Option<i64>,
+    /// 设备标识（签到 API 的隐藏必填头 `X-Device-Id` / `X-Machine-Id` 来源）。
+    /// 来自本机 storage.json 的 telemetry，或浏览器登录时绑定的设备；缺失时由 user_id/id 派生稳定值。
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub created_at: String,
     #[serde(default)]
     pub enabled: bool,
@@ -51,6 +57,8 @@ impl From<TraeLocalAccount> for Account {
             host: a.host,
             expires_at: a.expires_at,
             refresh_expires_at: a.refresh_expires_at,
+            device_id: a.device_id,
+            machine_id: a.machine_id,
             created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             enabled: true,
         }

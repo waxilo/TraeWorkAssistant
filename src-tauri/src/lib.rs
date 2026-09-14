@@ -17,7 +17,21 @@ use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Tauri updater 的 reqwest 默认走系统代理；本机代理（如 Clash）对 GitHub release-assets
+    // CDN 不稳定（HTTP 000 / 502），会导致 latest.json 都拉不下来。
+    // 启动时把 GitHub 相关域名加入 NO_PROXY，让更新器直连 GitHub。
+    const GITHUB_NO_PROXY: &str = "github.com,.github.com,githubusercontent.com,.githubusercontent.com";
+    match std::env::var("NO_PROXY") {
+        Ok(v) if !v.is_empty() => {
+            std::env::set_var("NO_PROXY", format!("{}, {}", v, GITHUB_NO_PROXY));
+        }
+        _ => {
+            std::env::set_var("NO_PROXY", GITHUB_NO_PROXY);
+        }
+    }
+
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(

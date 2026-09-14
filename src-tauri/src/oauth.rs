@@ -79,6 +79,10 @@ pub struct OAuthPoll {
     pub nickname: Option<String>,
     pub phone: Option<String>,
     pub expires_at: Option<i64>,
+    /// 登录时绑定的设备标识（签到必填头 `X-Device-Id` 来源）
+    pub device_id: Option<String>,
+    /// 登录时绑定的机器标识（签到必填头 `X-Machine-Id` 来源）
+    pub machine_id: Option<String>,
     pub error: Option<String>,
 }
 
@@ -95,6 +99,8 @@ impl OAuthPoll {
             nickname: None,
             phone: None,
             expires_at: None,
+            device_id: None,
+            machine_id: None,
             error: None,
         }
     }
@@ -691,10 +697,12 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         refresh_token: ex.refresh_token,
         host: Some(ex.apihost.clone()),
         region: region_for_host(&ex.apihost),
-        uid: if info.uid.is_empty() { None } else { Some(info.uid) },
+            uid: if info.uid.is_empty() { None } else { Some(info.uid) },
         nickname: info.nickname,
         phone: info.phone,
         expires_at: ex.expires_at,
+        device_id: Some(device_id.clone()),
+        machine_id: Some(machine_id.clone()),
         error: None,
     };
     cache_result(login_id, &result);

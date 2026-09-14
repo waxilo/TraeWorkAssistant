@@ -40,3 +40,10 @@ Desktop.ini
 .env
 .env.*
 !.env.example
+
+# --- Tauri updater signing key (NEVER commit) ---
+src-tauri/tauri.key
+src-tauri/tauri.key.pub
+
+# --- Local WorkBuddy memory (project-local, not for repo) ---
+.workbuddy/

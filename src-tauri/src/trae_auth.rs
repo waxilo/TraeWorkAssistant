@@ -58,6 +58,10 @@ pub struct TraeLocalAccount {
     pub nickname: Option<String>,
     pub phone: Option<String>,
     pub region: Option<String>,
+    /// 设备标识：来自 storage.json 顶层 `telemetry.devDeviceId`，签到必填头 `X-Device-Id` 来源
+    pub device_id: Option<String>,
+    /// 机器标识：来自 storage.json 顶层 `telemetry.machineId`，签到必填头 `X-Machine-Id` 来源
+    pub machine_id: Option<String>,
     /// access token 过期（毫秒）
     pub expires_at: Option<i64>,
     /// refresh token 过期（毫秒）
@@ -180,6 +184,11 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
         .and_then(|r| str_at(r, "region"))
         .or_else(|| account.and_then(|a| str_at(a, "region")));
 
+    // 设备/机器标识在 storage.json 顶层 `telemetry` 里（与登录态 blob 平级），签到接口必填头来源
+    let telemetry = json.get("telemetry");
+    let machine_id = telemetry.and_then(|t| str_at(t, "machineId"));
+    let device_id = telemetry.and_then(|t| str_at(t, "devDeviceId"));
+
     Some(TraeLocalAccount {
         user_id: str_at(&data, "userId"),
         token,
@@ -191,6 +200,8 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
                 .or_else(|| str_at(a, "mobile"))
         }),
         region,
+        device_id,
+        machine_id,
         expires_at: num_at(&data, "expiredAt"),
         refresh_expires_at: num_at(&data, "refreshExpiredAt"),
     })

@@ -565,7 +565,8 @@ mod tests {
         let mk = |id: &str| accounts::Account {
             id: id.into(), name: id.into(), phone: None, region: None, user_id: None,
             token: "t".into(), refresh_token: None, host: None, expires_at: None,
-            refresh_expires_at: None, created_at: String::new(), enabled: true,
+            refresh_expires_at: None, device_id: None, machine_id: None,
+            created_at: String::new(), enabled: true,
         };
         let all = vec![mk("a"), mk("b")];
         assert_eq!(billing_candidates(&all, &[]).len(), 2);

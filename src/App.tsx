@@ -64,7 +64,9 @@ export default function App() {
           {page === "accounts" && <AccountsPage notify={notify} />}
           {page === "gateway" && <GatewayPage settings={settings} update={update} />}
           {page === "logs" && <LogsPage />}
-          {page === "settings" && <SettingsPage settings={settings} update={update} />}
+          {page === "settings" && (
+            <SettingsPage settings={settings} update={update} notify={notify} />
+          )}
         </main>
       </div>
 

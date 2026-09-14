@@ -9,6 +9,8 @@ export interface Account {
   host?: string | null;
   expires_at?: number | null;
   refresh_expires_at?: number | null;
+  device_id?: string | null;
+  machine_id?: string | null;
   created_at: string;
   enabled: boolean;
 }
@@ -72,6 +74,8 @@ export interface OAuthPoll {
   nickname?: string | null;
   phone?: string | null;
   expires_at?: number | null;
+  device_id?: string | null;
+  machine_id?: string | null;
   error?: string | null;
 }
 

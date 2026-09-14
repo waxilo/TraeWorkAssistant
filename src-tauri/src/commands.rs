@@ -111,6 +111,8 @@ pub fn add_manual_account(
         host: host.filter(|h| !h.trim().is_empty()),
         expires_at: None,
         refresh_expires_at: None,
+        device_id: None,
+        machine_id: None,
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         enabled: true,
     };
