@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { getLogs, clearLogs } from "../api";
 import type { LogEntry } from "../types";
 
-export default function LogsPage() {
+function LogsPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
   const load = () => getLogs().then(setLogs).catch(() => {});
@@ -39,3 +39,5 @@ export default function LogsPage() {
     </section>
   );
 }
+
+export default memo(LogsPage);

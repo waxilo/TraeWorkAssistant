@@ -3,11 +3,12 @@
 mod accounts;
 mod checkin;
 mod commands;
-mod gateway;
-mod inject;
+mod endpoint;
+mod journal;
 mod logs;
 mod notify;
 mod oauth;
+mod proxy;
 mod refresh;
 mod scheduler;
 mod trae_auth;
@@ -39,16 +40,26 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            // 定时签到 + 池化网关：独立后台线程，与进程同生命周期
+            // 定时签到 + 智能接管反代：独立后台线程，与进程同生命周期
             scheduler::spawn(app.handle().clone());
-            gateway::spawn_gateway(app.handle().clone());
-            // 启动自愈：若已开启「自动接管」且用户已添加网关模型，在 TraeWork 未运行时自动选中
+            proxy::spawn_proxy(app.handle().clone());
+            // 启动清扫：等反代有机会绑定端口后，判断是否需要恢复 TraeWork 端点配置。
+            // 只保留「接管开启且反代确实在监听」这一种情形，其余一律恢复官方直连。
             let heal_app = app.handle().clone();
             std::thread::spawn(move || {
                 for _ in 0..12 {
                     if let Ok(d) = commands::try_data_dir(&heal_app) {
                         let s = accounts::load_settings(&d);
-                        let _ = crate::inject::self_heal(s.injection_enabled, s.gateway_port);
+                        if s.takeover_enabled {
+                            for _ in 0..30 {
+                                if proxy::status().active {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
+                        let keep = s.takeover_enabled && proxy::status().active;
+                        let _ = endpoint::sweep(&d, keep);
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -71,7 +82,6 @@ pub fn run() {
             commands::import_accounts,
             commands::remove_account,
             commands::discover_local,
-            commands::toggle_account,
             commands::checkin_one,
             commands::checkin_all,
             commands::checkin_status,
@@ -79,13 +89,14 @@ pub fn run() {
             commands::clear_logs,
             commands::get_settings,
             commands::save_settings,
-            commands::gateway_status,
             commands::oauth_start,
             commands::oauth_poll,
             commands::open_external,
-            commands::takeover_model,
             commands::takeover_status,
-            commands::release_takeover,
+            commands::takeover_enable,
+            commands::takeover_disable,
+            commands::takeover_events,
+            commands::clear_takeover_events,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

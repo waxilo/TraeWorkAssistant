@@ -1,4 +1,4 @@
-//! Tauri 命令层：账号管理、签到、积分、网关设置。
+//! Tauri 命令层：账号管理、签到、设置、智能接管。
 
 use crate::accounts::{self, Account, Settings};
 use crate::checkin;
@@ -69,17 +69,6 @@ pub fn discover_local(app: tauri::AppHandle) -> Result<Vec<Account>, String> {
         .collect())
 }
 
-#[tauri::command]
-pub fn toggle_account(app: tauri::AppHandle, id: String, enabled: bool) -> Result<Vec<Account>, String> {
-    let dir = try_data_dir(&app)?;
-    let mut list = accounts::load_accounts(&dir);
-    if let Some(a) = list.iter_mut().find(|a| a.id == id) {
-        a.enabled = enabled;
-    }
-    accounts::save_accounts(&dir, &list)?;
-    Ok(list)
-}
-
 // ---------------------------------------------------------------------------
 // 签到
 // ---------------------------------------------------------------------------
@@ -114,14 +103,37 @@ pub async fn checkin_all(app: tauri::AppHandle) -> Result<Vec<checkin::CheckinRe
 }
 
 #[tauri::command]
-pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<(String, serde_json::Value)>, String> {
+pub async fn checkin_status(app: tauri::AppHandle) -> Result<Vec<checkin::AccountStatus>, String> {
     let dir = try_data_dir(&app)?;
-    let list = accounts::load_accounts(&dir);
+    let mut list = accounts::load_accounts(&dir);
     let mut out = Vec::new();
-    for account in &list {
-        if let Some(data) = checkin::query_status(account).await {
-            out.push((account.id.clone(), data));
+    let mut dirty = false;
+    for account in list.iter_mut() {
+        // ① 今日是否已签到（签到状态接口）
+        let status = checkin::query_status(account).await;
+        // ② 账号已有积分（entitlement 用量接口）；拉到就落盘，供界面展示与接管选号
+        if let Some(u) = checkin::fetch_ent_usage(account).await {
+            let next = accounts::CreditSnapshot::now(u.remaining, u.unlimited, u.earliest_expiry_ms);
+            let prev = account.credit_snapshot.as_ref();
+            let changed = prev.map(|p| (p.credits, p.unlimited, p.earliest_expiry_ms))
+                != Some((next.credits, next.unlimited, next.earliest_expiry_ms));
+            if changed {
+                account.credit_snapshot = Some(next);
+                dirty = true;
+            }
         }
+        // 拉不到（限流 9074 / 掉线）时沿用上次已知的积分，而不是把已有数字抹成未知
+        let snap = account.credit_snapshot.as_ref();
+        out.push(checkin::AccountStatus {
+            id: account.id.clone(),
+            checked_in: status.as_ref().map(checkin::is_checked_in).unwrap_or(false),
+            message: status.as_ref().map(checkin::message_of).unwrap_or_default(),
+            credits: snap.and_then(|s| s.credits),
+            unlimited: snap.map(|s| s.unlimited).unwrap_or(false),
+        });
+    }
+    if dirty {
+        let _ = accounts::save_accounts(&dir, &list);
     }
     Ok(out)
 }
@@ -157,11 +169,6 @@ pub fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<Settin
     Ok(settings)
 }
 
-#[tauri::command]
-pub fn gateway_status() -> crate::gateway::GatewayStatus {
-    crate::gateway::status()
-}
-
 // ---------------------------------------------------------------------------
 // 浏览器登录（OAuth）
 // ---------------------------------------------------------------------------
@@ -191,92 +198,191 @@ pub fn open_external(url: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 池化网关「自动接管」（用户已手动添加自定义模型 + 助手自动选中）
+// 智能接管：本地反代 + TraeWork 端点覆盖（一体开关）
 // ---------------------------------------------------------------------------
 
-/// 接管结果。`matched=false` 表示本机尚未检测到用户添加的网关模型（需用户先手动添加）。
+/// 智能接管的完整状态（供界面一次性渲染）。
 #[derive(serde::Serialize, Clone)]
-pub struct TakeoverOutcome {
-    /// 本次是否自动退出了 TraeWork 后再写入选中并重启。
-    pub restarted: bool,
-    /// 本机是否已有指向网关的自定义模型（用户是否已手动添加）。
-    pub matched: bool,
-    /// 被自动选中的 agent 入口列表。
-    pub labels: Vec<String>,
-    /// 本机网关地址（即用户需填的 Base URL）。
-    pub base_url: String,
+pub struct TakeoverStatus {
+    /// 用户是否开启了智能接管（对应 `Settings.takeover_enabled`）。
+    pub enabled: bool,
+    /// 本地反代监听端口。
+    pub port: u16,
+    /// 本地反代是否正在监听。
+    pub proxy_active: bool,
+    /// 反代启动失败原因（端口占用等）。
+    pub proxy_error: Option<String>,
+    /// TraeWork 当前是否在运行。
+    pub trae_running: bool,
+    /// 是否找到 TraeWork 安装目录（找不到则本机不支持接管）。
+    pub supported: bool,
+    pub app_dir: Option<String>,
+    /// 端点覆盖文件当前是否存在。
+    pub installed: bool,
+    /// 覆盖文件是否由本助手写入（用户自己写的文件为 `false`，不会被清理）。
+    pub ours: bool,
+    /// TraeWork 安装目录是否可写。
+    pub writable: bool,
+    /// 本机反代基址（即覆盖写入的 `remote.domain`）。
+    pub http_base: String,
+    /// 原始上游（取自 `product.json`，便于界面展示与排障）。
+    pub upstream_http: Option<String>,
+    pub upstream_ws: Option<String>,
+    /// 端点覆盖租约是否新鲜（反代的心跳）。
+    pub lease_fresh: bool,
     pub message: String,
 }
 
-/// 自动接管：把用户已添加的网关模型选为各 agent 入口的当前模型。
-///
-/// 先做一次**只读**预检（即便 TraeWork 运行中也能判断用户是否已添加）；若已添加，
-/// 则在「TraeWork 未运行时」写入选中记录（必要时自动退出 → 写入 → 重启）。
-/// 若用户尚未在 TraeWork 添加自定义模型，返回 `matched=false` 与引导文案，不报错。
-#[tauri::command]
-pub fn takeover_model(app: tauri::AppHandle) -> Result<TakeoverOutcome, String> {
-    let dir = try_data_dir(&app)?;
-    let port = settings(&app).gateway_port;
-    let base_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    // 只读预检：用户是否已添加指向本机网关的自定义模型
-    let matched_models = crate::inject::find_gateway_models(port);
-    let mut settings = settings(&app);
-    if matched_models.is_empty() {
-        // 未添加：保留偏好（下次添加后自动生效），返回引导文案
-        settings.injection_enabled = true;
-        accounts::save_settings(&dir, &settings)?;
-        return Ok(TakeoverOutcome {
-            restarted: false,
-            matched: false,
-            labels: vec![],
-            base_url: base_url.clone(),
-            message: format!(
-                "未在 TraeWork 检测到指向本机网关的自定义模型（Base URL 应为 {base_url}）。请先：\
-                 TraeWork 设置 → 模型 → 添加自定义模型（OpenAI 兼容），Base URL 填上面的地址并保存；\
-                 之后重新开启本开关，助手会自动选中它。"
-            ),
-        });
+fn build_status(dir: &std::path::Path, s: &Settings) -> TakeoverStatus {
+    let http_base = format!("http://127.0.0.1:{}", s.takeover_port);
+    let ep = crate::endpoint::status(dir, &http_base);
+    let px = crate::proxy::status();
+    let message = if !ep.supported {
+        "未找到 TraeWork 安装目录，本机不支持「智能接管」。".to_string()
+    } else if ep.installed && !ep.ours {
+        "检测到 product.desktop.local.json，但并非本助手写入——助手不会接管也不会清理它。".to_string()
+    } else if s.takeover_enabled && px.active && ep.installed {
+        "接管已生效：TraeWork 的模型/会话请求将经本机反代按账号池转发。".to_string()
+    } else if s.takeover_enabled && px.active {
+        "本地反代已就绪，但端点覆盖尚未写入。重新开启开关即可完成接管。".to_string()
+    } else if s.takeover_enabled {
+        "已开启接管，但本地反代未在监听——请检查端口是否被占用。".to_string()
+    } else {
+        "未开启智能接管。".to_string()
+    };
+    TakeoverStatus {
+        enabled: s.takeover_enabled,
+        port: s.takeover_port,
+        proxy_active: px.active,
+        proxy_error: px.error,
+        trae_running: crate::endpoint::is_trae_running(),
+        supported: ep.supported,
+        app_dir: ep.app_dir,
+        installed: ep.installed,
+        ours: ep.ours,
+        writable: ep.writable,
+        http_base,
+        upstream_http: ep.upstream_http,
+        upstream_ws: ep.upstream_ws,
+        lease_fresh: ep.lease_fresh,
+        message,
     }
-    // 已添加：在 TraeWork 未运行时写入选中（必要时自动退出 → 写入 → 重启）
-    let (res, restarted) =
-        crate::inject::with_trae_restart(|| crate::inject::select_gateway_model(port))?;
-    let (_count, labels) = res;
-    settings.injection_enabled = true;
-    accounts::save_settings(&dir, &settings)?;
-    Ok(TakeoverOutcome {
-        restarted,
-        matched: true,
-        labels: labels.clone(),
-        base_url: base_url.clone(),
-        message: format!(
-            "已为 {} 个 agent 入口自动选中你添加的网关模型（{}）。{}",
-            labels.len(),
-            base_url,
-            if restarted {
-                "已自动退出并重启 TraeWork，重新打开即可见为已选中。"
-            } else {
-                "重启 TraeWork 后，在模型选择器即可见为已选中。"
-            }
-        ),
-    })
 }
 
-/// 当前接管状态 + TraeWork 运行态。
+/// 只读：当前智能接管状态（不修改任何文件）。
 #[tauri::command]
-pub fn takeover_status() -> crate::inject::TakeoverStatus {
-    let port = crate::gateway::status().port;
-    crate::inject::takeover_status(port)
-}
-
-/// 解除接管：仅清空助手写入的「网关模型选中」，绝不删除用户自己的自定义模型。
-/// 若检测到 TraeWork 运行中，会**自动退出 → 清空选中 → 再启动**。
-#[tauri::command]
-pub fn release_takeover(app: tauri::AppHandle) -> Result<usize, String> {
+pub fn takeover_status(app: tauri::AppHandle) -> Result<TakeoverStatus, String> {
     let dir = try_data_dir(&app)?;
-    let port = settings(&app).gateway_port;
-    let (n, _restarted) = crate::inject::with_trae_restart(|| crate::inject::clear_gateway_selection(port))?;
-    let mut settings = settings(&app);
-    settings.injection_enabled = false;
-    accounts::save_settings(&dir, &settings)?;
-    Ok(n)
+    let s = accounts::load_settings(&dir);
+    Ok(build_status(&dir, &s))
+}
+
+/// 开启智能接管：启用本地反代 → 确认已监听 → 写入 TraeWork 端点覆盖并重启它。
+///
+/// 顺序是**刻意**的：必须先确认反代在监听，才允许写覆盖，否则 TraeWork 全量请求会打到死端口。
+/// 退出/重启 TraeWork 可能耗时到 20s，故整体走 `spawn_blocking`，避免同步命令冻结 UI。
+#[tauri::command]
+pub async fn takeover_enable(app: tauri::AppHandle) -> Result<TakeoverStatus, String> {
+    let dir = try_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || enable_blocking(dir))
+        .await
+        .map_err(|e| format!("开启接管任务异常：{e}"))?
+}
+
+fn enable_blocking(dir: PathBuf) -> Result<TakeoverStatus, String> {
+    let mut s = accounts::load_settings(&dir);
+    let port = s.takeover_port;
+
+    // 1) 先开启：让反代线程开始监听（反代只在 takeover_enabled 时绑定端口）
+    if !s.takeover_enabled {
+        s.takeover_enabled = true;
+        accounts::save_settings(&dir, &s)?;
+    }
+
+    // 2) 等反代真正就绪（最多 ~3s）；不就绪则回滚，绝不留下指向死端口的覆盖
+    let mut ready = false;
+    for _ in 0..30 {
+        let st = crate::proxy::status();
+        if st.active && st.port == port {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !ready {
+        let mut s2 = accounts::load_settings(&dir);
+        s2.takeover_enabled = false;
+        accounts::save_settings(&dir, &s2)?;
+        let err = crate::proxy::status().error.unwrap_or_default();
+        crate::journal::append(
+            &dir,
+            "proxy_error",
+            &format!(
+                "本地反代未能在 127.0.0.1:{port} 监听{}，已回滚，TraeWork 未被改动",
+                if err.is_empty() { String::new() } else { format!("（{err}）") }
+            ),
+        );
+        return Err(format!(
+            "本地反代未能在 127.0.0.1:{port} 监听{}，已回滚，未改动 TraeWork。",
+            if err.is_empty() { String::new() } else { format!("（{err}）") }
+        ));
+    }
+
+    // 3) 写端点覆盖 + 重启 TraeWork 使其生效
+    let http_base = format!("http://127.0.0.1:{port}");
+    let dir2 = dir.clone();
+    let (_status, restarted) =
+        crate::endpoint::with_trae_restart(|| crate::endpoint::install(&dir2, &http_base, None))?;
+    if restarted {
+        crate::journal::append(
+            &dir,
+            "restart_trae",
+            "为让端点覆盖生效，已退出并重启 TraeWork（未保存的输入请自行确认）",
+        );
+    }
+
+    let s3 = accounts::load_settings(&dir);
+    Ok(build_status(&dir, &s3))
+}
+
+/// 关闭智能接管：删除端点覆盖并重启 TraeWork 恢复官方直连，然后停掉本地反代。
+#[tauri::command]
+pub async fn takeover_disable(app: tauri::AppHandle) -> Result<TakeoverStatus, String> {
+    let dir = try_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // 先恢复 TraeWork（覆盖不在了，「指向死端口」的风险即消失），再停反代
+        let dir2 = dir.clone();
+        let (_removed, restarted) =
+            crate::endpoint::with_trae_restart(|| crate::endpoint::uninstall(&dir2))?;
+        let mut s = accounts::load_settings(&dir);
+        s.takeover_enabled = false;
+        accounts::save_settings(&dir, &s)?;
+        if restarted {
+            crate::journal::append(
+                &dir,
+                "restart_trae",
+                "为恢复官方直连已重启 TraeWork",
+            );
+        }
+        Ok(build_status(&dir, &s))
+    })
+    .await
+    .map_err(|e| format!("关闭接管任务异常：{e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// 接管动态（journal）
+// ---------------------------------------------------------------------------
+
+/// 读取接管动态（最新在前）：谁在什么时候用了哪个账号、有没有被限流换号、代理有没有报错。
+#[tauri::command]
+pub fn takeover_events(app: tauri::AppHandle) -> Result<Vec<crate::journal::JournalEvent>, String> {
+    Ok(crate::journal::read(&try_data_dir(&app)?))
+}
+
+/// 清空接管动态（不可恢复）。
+#[tauri::command]
+pub fn clear_takeover_events(app: tauri::AppHandle) -> Result<(), String> {
+    crate::journal::clear(&try_data_dir(&app)?);
+    Ok(())
 }

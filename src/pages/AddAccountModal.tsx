@@ -74,7 +74,6 @@ export default function AddAccountModal({ onClose, onImported, notify, setStatus
             device_id: p.device_id ?? null,
             machine_id: p.machine_id ?? null,
             created_at: new Date().toISOString(),
-            enabled: true,
           };
           const list = await importAccounts([acct]);
           onImported(list);

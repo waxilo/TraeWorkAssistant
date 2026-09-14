@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import type { Settings } from "../types";
 import { checkAndInstall, type UpdateProgress } from "../updater";
+import Switch from "../components/Switch";
 
 interface Props {
   settings: Settings | null;
@@ -9,7 +10,7 @@ interface Props {
   notify: (msg: string) => void;
 }
 
-export default function SettingsPage({ settings, update, notify }: Props) {
+function SettingsPage({ settings, update, notify }: Props) {
   const [version, setVersion] = useState("");
   const [progress, setProgress] = useState<UpdateProgress | null>(null);
   const [busy, setBusy] = useState(false);
@@ -33,15 +34,17 @@ export default function SettingsPage({ settings, update, notify }: Props) {
     <>
       <section className="card">
         <h2>设置</h2>
-        <div className="form" style={{ maxWidth: 420 }}>
-          <label style={{ flexDirection: "row", alignItems: "center" }}>
-            <input
-              type="checkbox"
+        <div className="form" style={{ maxWidth: 460 }}>
+          <div className="switch-row">
+            <Switch
               checked={!!settings?.checkin_enabled}
-              onChange={(e) => update({ checkin_enabled: e.target.checked })}
+              onChange={(v) => update({ checkin_enabled: v })}
             />
-            启用定时签到
-          </label>
+            <span className="switch-label">启用定时签到</span>
+            <span className="switch-hint">
+              {settings?.checkin_enabled ? `每天 ${settings?.checkin_time || "10:00"}` : "已停用"}
+            </span>
+          </div>
           {settings?.checkin_enabled !== false && (
             <label>
               定时签到时刻
@@ -60,14 +63,6 @@ export default function SettingsPage({ settings, update, notify }: Props) {
               value={settings?.webhook_url || ""}
               onChange={(e) => update({ webhook_url: e.target.value })}
             />
-          </label>
-          <label style={{ flexDirection: "row", alignItems: "center" }}>
-            <input
-              type="checkbox"
-              checked={!!settings?.gateway_enabled}
-              onChange={(e) => update({ gateway_enabled: e.target.checked })}
-            />
-            同步开启本地网关
           </label>
         </div>
         <p className="muted">
@@ -101,3 +96,5 @@ export default function SettingsPage({ settings, update, notify }: Props) {
     </>
   );
 }
+
+export default memo(SettingsPage);

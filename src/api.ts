@@ -1,14 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
-  GatewayStatus,
   Settings,
   CheckinResult,
   LogEntry,
+  JournalEvent,
   AcctStatus,
   OAuthStart,
   OAuthPoll,
-  TakeoverOutcome,
   TakeoverStatus,
 } from "./types";
 
@@ -18,21 +17,11 @@ export const importAccounts = (accounts: Account[]) =>
 export const removeAccount = (id: string) =>
   invoke<Account[]>("remove_account", { id });
 export const discoverLocal = () => invoke<Account[]>("discover_local");
-export const toggleAccount = (id: string, enabled: boolean) =>
-  invoke<Account[]>("toggle_account", { id, enabled });
 export const checkinOne = (id: string) => invoke<CheckinResult>("checkin_one", { id });
 export const checkinAll = () => invoke<CheckinResult[]>("checkin_all");
-export const checkinStatus = async (): Promise<AcctStatus[]> => {
-  const rows = await invoke<[string, Record<string, unknown> | null][]>("checkin_status");
-  return rows.map(([id, data]) => ({
-    id,
-    checked_in: !!data?.checked_in,
-    credits: (data?.credits as number) ?? null,
-    message: (data?.message as string) ?? "",
-  }));
-};
+/** 每个账号的签到状态 + **账号已有积分**（后端直接返回结构化数据，前端不再自行解析 JSON） */
+export const checkinStatus = () => invoke<AcctStatus[]>("checkin_status");
 export const getSettings = () => invoke<Settings>("get_settings");
-export const getGatewayStatus = () => invoke<GatewayStatus>("gateway_status");
 export const saveSettings = (settings: Settings) =>
   invoke<Settings>("save_settings", { settings });
 export const getLogs = () => invoke<LogEntry[]>("get_logs");
@@ -43,6 +32,9 @@ export const oauthPoll = (loginId: string) =>
   invoke<OAuthPoll>("oauth_poll", { loginId });
 export const openExternal = (url: string) => invoke<void>("open_external", { url });
 
-export const takeoverModel = () => invoke<TakeoverOutcome>("takeover_model");
 export const getTakeoverStatus = () => invoke<TakeoverStatus>("takeover_status");
-export const releaseTakeover = () => invoke<number>("release_takeover");
+export const enableTakeover = () => invoke<TakeoverStatus>("takeover_enable");
+export const disableTakeover = () => invoke<TakeoverStatus>("takeover_disable");
+/** 接管动态（最新在前）：谁用了哪个账号、有没有限流换号、代理是否报错 */
+export const takeoverEvents = () => invoke<JournalEvent[]>("takeover_events");
+export const clearTakeoverEvents = () => invoke<void>("clear_takeover_events");

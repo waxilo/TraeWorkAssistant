@@ -1,12 +1,48 @@
 //! TraeWork 签到：查询状态 + 领取。
 //!
-//! 端点（从官方客户端解包与论坛技能包交叉验证，路径可能随版本调整，用数组兼容多版本）：
-//! - 状态：`POST /trae/api/v2/ug/checkin_credits/status`
-//! - 领取：`POST /trae/api/v2/ug/checkin_credits/claim`
+//! ## 端点与请求形态（逆向 `TRAE SOLO CN` 的 `out/main.js` 逐字核对）
 //!
-//! 鉴权头：`Authorization: Cloud-IDE-JWT <token>`（不是 Bearer）。
+//! 官方实现在 `CNCommercialService`：
 //!
-//! host 由账号数据里的 `host` 决定（如 `https://api.trae.cn`）。
+//! ```js
+//! async eb(path, method, apiName) {
+//!   const s = await getAuthUserInfo();
+//!   const url = await getApi(ugApi, path);              // bootConfig.ugApi + path
+//!   const o = this.cb(s.token);                          // {headers:{Content-Type, Authorization:`Cloud-IDE-JWT <token>`}}
+//!   this.fb(o.headers);                                  // + x-device-id / x-device-brand / x-device-type / x-os-version / x-app-version
+//!   const a = Pr(this.P) ? 2 : 1;                        // req_source：Lite=2 / IDE=1
+//!   return fetchWithHeaders({ url, method, data: {req_source: a}, timeout: 30000, ...o });
+//! }
+//! fetchCheckinCreditsStatus() -> eb("/trae/api/v2/ug/checkin_credits/status", "POST", "checkin_status")
+//! claimCheckinCredits()       -> eb("/trae/api/v2/ug/checkin_credits/claim",  "POST", "checkin_claim")
+//! ```
+//!
+//! 三个**关键细节**（漏掉任一个都会被服务端按「非法客户端」处理）：
+//!
+//! 1. **域名走 `bootConfig.ugApi`**，本机 `product.json` 里 `ug.trae.normal = https://api.trae.cn`
+//!    （与 `account.trae.normal` 同值，所以沿用账号 `host` 亦等价）。
+//! 2. **body 必须是 `{"req_source":2}`**（Lite 客户端），不是 `{}`。
+//! 3. **鉴权头是 `Cloud-IDE-JWT <token>`**（非 Bearer）；设备头用小写 `x-*` 系列，
+//!    `x-device-id` = 本机设备标识，`x-app-version` = 客户端版本号。
+//!
+//! ## 响应形态（真机实测）
+//!
+//! ```text
+//! status: {"checked_in":false,"code":0,"credits":150,"did_checked_in":false,
+//!          "enable":true,"extra_credits":50,"message":"success"}
+//! claim : {"code":0,"message":"success"}            // 成功
+//! claim : {"code":9074,"message":"当前参与用户太多，请稍后再试"}   // 服务端限流
+//! ```
+//!
+//! ## 9074 的处理（这是「签到老是失败」的真正原因）
+//!
+//! 实测：账号状态正常（`enable:true, checked_in:false, code:0`），但 `claim` 会**持续**
+//! 返回 9074 —— 与请求体、设备头、`req_source` 取值**均无关**（已逐项对照验证），
+//! 是服务端对领取接口的**限流/排队**，过一段时间会自行放行。
+//! 因此这里采用**递增退避 + 多轮重试**，而不是「试一次就写个失败」。
+//!
+//! 注：领取成功后重复调用同样返回 `{"code":0,"message":"success"}`（幂等），
+//! 所以重试不会重复发放。
 
 use crate::accounts::Account;
 use regex::Regex;
@@ -14,11 +50,23 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-const STATUS_PATHS: &[&str] = &[
-    "/trae/api/v2/ug/checkin_credits/status",
-    "/ug/checkin_credits/status",
-];
-const CLAIM_PATHS: &[&str] = &["/trae/api/v2/ug/checkin_credits/claim"];
+/// 状态查询路径（官方唯一路径）。
+const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
+/// 领取路径（官方唯一路径）。
+const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+/// **账号已有积分**（额度用量）路径。
+///
+/// 官方实现（`out/main.js` 的 `pb()`）：
+/// `db("/trae/api/v2/pay/ide_user_ent_usage", {require_usage:true, req_source:2|1}, cb(token))`。
+/// ⚠️ 这跟 [`STATUS_PATH`] 返回的 `credits`（**签到奖励**）完全是两回事。
+const ENT_USAGE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
+/// `req_source`：Lite 客户端 = 2（IDE = 1）。
+const REQ_SOURCE_LITE: i64 = 2;
+/// 缺省客户端版本（读不到本机 TraeWork `product.json` 时兜底）。
+const FALLBACK_APP_VERSION: &str = "1.107.1";
+
+/// 领取失败时的重试退避（秒）。共 5 次尝试，覆盖约 75 秒。
+const CLAIM_BACKOFF_SECS: &[u64] = &[0, 3, 8, 20, 45];
 
 static ALREADY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("已签到|已领取|already\\s*(?:checked[- ]?in|claimed)|daily.*already").unwrap()
@@ -33,11 +81,40 @@ pub struct CheckinResult {
     pub success: bool,
     pub already: bool,
     pub inactive: bool,
+    /// 瞬时失败（服务端限流 9074 / 网络错误）——调用方可稍后再试一轮
+    pub transient: bool,
+    /// 鉴权失败（token 失效，需要重新登录或刷新）
+    pub auth_failed: bool,
     pub message: String,
-    /// 本次签到获得积分
+    /// 签到积分余额（服务端 `credits` 原值）
     pub credit: Option<i64>,
     pub host: Option<String>,
     pub at: String,
+}
+
+/// 账号状态（给界面用）：今日签到情况 + **账号已有积分**。
+///
+/// ⚠️ `credits` 来自 entitlement 用量接口的剩余额度，**不是**签到奖励
+/// （签到奖励在 [`CheckinResult::credit`]）。
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct AccountStatus {
+    pub id: String,
+    pub checked_in: bool,
+    /// 账号已有积分；未知为 `None`
+    pub credits: Option<i64>,
+    /// 不限量
+    pub unlimited: bool,
+    pub message: String,
+}
+
+/// 签到状态响应里「今日是否已签到」。
+pub fn is_checked_in(v: &Value) -> bool {
+    status_fields(v).0
+}
+
+/// 响应里的提示语。
+pub fn message_of(v: &Value) -> String {
+    msg_of(v)
 }
 
 fn host_of(account: &Account) -> String {
@@ -56,52 +133,64 @@ fn normalize_host(url: &str) -> String {
     }
 }
 
-/// 设备/机器标识：优先用账号存的，否则用 user_id，再否则用 id 派生稳定值
-/// （保证同一账号每次请求一致；Trae 签到接口把设备头当必填项，缺则 9004 参数错误）。
-fn device_ids(account: &Account) -> (String, String) {
-    let dev = account
-        .device_id
-        .clone()
-        .or_else(|| account.user_id.clone())
-        .unwrap_or_else(|| account.id.clone());
-    let mach = account
-        .machine_id
-        .clone()
-        .or_else(|| account.user_id.clone())
-        .unwrap_or_else(|| account.id.clone());
-    (dev, mach)
+/// 本机 TraeWork 的客户端版本号（`x-app-version`）。
+/// 读 `resources/app/product.json` 的 `version`；失败则用兜底值。结果进程内缓存。
+pub fn app_version() -> String {
+    static CACHE: LazyLock<String> = LazyLock::new(|| {
+        crate::endpoint::app_dir()
+            .and_then(|d| std::fs::read_to_string(d.join("product.json")).ok())
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| {
+                v.get("version")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| FALLBACK_APP_VERSION.to_string())
+    });
+    CACHE.clone()
 }
 
-/// 请求头：鉴权用 `Cloud-IDE-JWT`，并带齐签到接口必填头。
-///
-/// - `X-Device-Id` / `X-Machine-Id`：设备标识，缺省会导致 claim/status 报 **9004 参数错误**
-///   （即 "The submitted order parameters are incorrect"）；
-/// - `X-User-Region`：区域，缺失也会被部分端点判为参数错误；
-/// - `X-User-Id`：用户标识（社区实践表明补充后更稳）。
+/// 设备标识。优先用 `user_id`（真实账号身份，服务端必然认识），
+/// 退回设备/机器标识，最后用本地账号记录 id。
+fn device_id(account: &Account) -> String {
+    account
+        .user_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| account.device_id.clone())
+        .or_else(|| account.machine_id.clone())
+        .unwrap_or_else(|| account.id.clone())
+}
+
+fn device_type() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    }
+}
+
+/// 请求头：`Cloud-IDE-JWT` 鉴权 + 官方设备头（小写 `x-*`）。
 fn headers(account: &Account) -> (String, Vec<(String, String)>) {
-    let (dev, mach) = device_ids(account);
-    let mut hdrs: Vec<(String, String)> = vec![
+    let hdrs: Vec<(String, String)> = vec![
         ("Content-Type".into(), "application/json".into()),
-        ("Accept".into(), "application/json".into()),
-        ("X-Device-Id".into(), dev),
-        ("X-Machine-Id".into(), mach),
+        ("x-device-id".into(), device_id(account)),
+        ("x-device-type".into(), device_type().into()),
+        ("x-app-version".into(), app_version()),
     ];
-    if let Some(r) = &account.region {
-        hdrs.push(("X-User-Region".into(), r.clone()));
-    }
-    if let Some(u) = &account.user_id {
-        if !u.is_empty() {
-            hdrs.push(("X-User-Id".into(), u.clone()));
-        }
-    }
-    (
-        format!("Cloud-IDE-JWT {}", account.token),
-        hdrs,
-    )
+    (format!("Cloud-IDE-JWT {}", account.token), hdrs)
 }
 
-/// 是否可重试的瞬时失败（服务器繁忙/限流，社区已知 code 9074）。
-fn is_transient_busy(code: Option<i64>, msg: &str) -> bool {
+/// 请求体：`{"req_source":2}`。
+fn claim_body() -> String {
+    format!("{{\"req_source\":{REQ_SOURCE_LITE}}}")
+}
+
+/// 服务端限流（9074）/ 网络错误的瞬时失败。
+fn is_transient(code: Option<i64>, msg: &str) -> bool {
     if code == Some(9074) {
         return true;
     }
@@ -112,9 +201,22 @@ fn is_transient_busy(code: Option<i64>, msg: &str) -> bool {
         || m.contains("too many")
         || m.contains("rate limit")
         || m.contains("participants")
+        || m.contains("稍后再试")
 }
 
-/// 从 status 响应取值：`checked_in`（今日是否已签）、`enable`、`credits`
+/// 鉴权失败（token 不可用）。
+fn is_auth_error(code: Option<i64>, msg: &str) -> bool {
+    if code == Some(1001) {
+        return true;
+    }
+    let m = msg.to_ascii_lowercase();
+    m.contains("authenticate")
+        || m.contains("unauthor")
+        || m.contains("token")
+        || m.contains("1001")
+}
+
+/// 从 status/claim 响应取值：`checked_in`（今日是否已签）、`enable`、`credits`
 fn status_fields(v: &Value) -> (bool, bool, Option<i64>) {
     let checked_in = v
         .get("checked_in")
@@ -126,10 +228,12 @@ fn status_fields(v: &Value) -> (bool, bool, Option<i64>) {
     (checked_in, enable, credits)
 }
 
-/// 从 status/claim 响应里取积分：先看 `data`，再看顶层 `credits`。
-/// 会员态日常会把 `extra_credits`（加量）合并进展示值。
+/// 从响应里取**签到奖励**积分。服务端顶层为 `credits`，另有 `extra_credits`（会员加量）；
+/// 官方客户端展示的是 `credits`，此处保持一致。
+///
+/// ⚠️ 这是「签到给了多少分」，**不是**账号已有积分——后者见 [`parse_ent_usage`]。
 fn parse_credit(body: &Value) -> Option<i64> {
-    let keys = ["credit", "credits", "gain_credit", "today_credit"];
+    let keys = ["credits", "credit", "gain_credit", "today_credit"];
     for r in [body, body.get("data").unwrap_or(&Value::Null)] {
         for key in keys {
             if let Some(v) = r.get(key) {
@@ -144,176 +248,487 @@ fn parse_credit(body: &Value) -> Option<i64> {
             }
         }
     }
-    // 合并加量积分：credits + extra_credits（会员每日加量）
-    let base = body.get("credits").and_then(Value::as_i64);
-    let extra = body.get("extra_credits").and_then(Value::as_i64);
-    base.zip(extra).map(|(b, e)| b + e).or(base)
+    None
 }
 
-fn classify(http_ok: bool, code: Option<i64>, msg: &str) -> (bool, bool, bool) {
-    let inactive = INACTIVE_RE.is_match(msg);
-    let already = code == Some(0) && ALREADY_RE.is_match(msg) && !inactive;
-    let ok = !inactive && ((code == Some(0) && http_ok) || already);
-    (ok, already, inactive)
+fn msg_of(body: &Value) -> String {
+    body.get("msg")
+        .or_else(|| body.get("message"))
+        .or_else(|| body.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
-/// 对一个账号执行签到，遍历候选路径，命中明确结果即返回。
+/// 查询签到状态（best-effort）。返回响应体本体（含 `checked_in`/`credits`/`enable`）。
+pub async fn query_status(account: &Account) -> Option<Value> {
+    let client = reqwest::Client::new();
+    query_status_with(&client, account).await
+}
+
+/// 同 [`query_status`]，但复用外部 `client`（反代路由每 10 分钟要批量取一次，
+/// 复用连接池避免每个账号都新建一次客户端）。
+pub async fn query_status_with(client: &reqwest::Client, account: &Account) -> Option<Value> {
+    let host = normalize_host(&host_of(account));
+    let (auth_hdr, hdrs) = headers(account);
+    let url = format!("{host}{STATUS_PATH}");
+    let mut req = client
+        .post(&url)
+        .header("Authorization", &auth_hdr)
+        .body(claim_body())
+        .timeout(Duration::from_secs(15));
+    for (k, v) in &hdrs {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.ok()?;
+    let v = resp.json::<Value>().await.ok()?;
+    if v.get("code").and_then(Value::as_i64) == Some(0) {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// 把数字/字符串时间统一成毫秒时间戳（秒会被识别并放大）。
+fn to_ms(x: &Value) -> Option<i64> {
+    if let Some(n) = x.as_i64() {
+        // 启发式：小于 1e12 视为秒级时间戳（约公元 33658 年才是 1e12 秒）
+        return Some(if n < 1_000_000_000_000 {
+            n.saturating_mul(1000)
+        } else {
+            n
+        });
+    }
+    let s = x.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return to_ms(&Value::from(n));
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(t.and_utc().timestamp_millis());
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis());
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+/// 一个账号的「已有积分」画像（来自 entitlement 用量接口）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EntUsage {
+    /// 剩余可用积分（Σ max(credits_limit − credits_amount, 0)，四舍五入到整数）；
+    /// 不限量、或没有任何额度包时为 `None`
+    pub remaining: Option<i64>,
+    /// 不限量（存在 `credits_limit = -1` 的包）
+    pub unlimited: bool,
+    /// 「**还有余量**的额度包」里最早的到期时间（毫秒）；未知为 `None`
+    pub earliest_expiry_ms: Option<i64>,
+}
+
+/// 额度包的到期时间（毫秒）：包级 `expire_time` → `end_time` → `yearly_expire_time`。
+/// 真实数据里 `expire_time` 是**秒**级时间戳且与 `end_time` 同值，由 [`to_ms`] 统一。
+fn pack_expiry_ms(pack: &Value) -> Option<i64> {
+    for node in [Some(pack), pack.get("entitlement_base_info")].into_iter().flatten() {
+        for key in ["expire_time", "end_time", "yearly_expire_time"] {
+            if let Some(ms) = node.get(key).and_then(to_ms) {
+                if ms > 0 {
+                    return Some(ms);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 汇总 `ide_user_ent_usage` 响应 —— 逐行照搬官方 `hHe()`（`out/main.js`）：
+/// 遍历 `user_entitlement_pack_list`，对 `credits_limit > 0` 的包累加
+/// `max(credits_limit − usage.credits_amount, 0)`；`credits_limit == -1` 视为不限量。
+///
+/// 真实响应（2026-09-14 实机）：`credits_amount` 是**小数**（如 579.3308），
+/// `usage` 可能为空对象（视为 0），`code` 字段不存在。
+///
+/// 到期时间官方 `hHe()` 不计算，是本项目补的：**只有还剩额度的包**才参与
+/// 「到期最早」比较 —— 一个已经用光的包到期再早也没有意义，不该把排序带偏。
+pub fn parse_ent_usage(v: &Value) -> EntUsage {
+    let Some(packs) = v.get("user_entitlement_pack_list").and_then(Value::as_array) else {
+        return EntUsage::default();
+    };
+    let mut remaining: f64 = 0.0;
+    let mut unlimited = false;
+    let mut has_quota = false;
+    let mut earliest: Option<i64> = None;
+    for pack in packs {
+        let limit = pack
+            .get("entitlement_base_info")
+            .and_then(|b| b.get("quota"))
+            .and_then(|q| q.get("credits_limit"))
+            .and_then(Value::as_f64);
+        let Some(limit) = limit else { continue };
+        if limit < 0.0 {
+            // -1 = 不限量（真实数据里只有 -1；防御性地把任何负数都当不限量）
+            unlimited = true;
+            has_quota = true;
+            continue;
+        }
+        if limit == 0.0 {
+            continue;
+        }
+        let used = pack
+            .get("usage")
+            .and_then(|u| u.get("credits_amount"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let left = (limit - used).max(0.0);
+        has_quota = true;
+        remaining += left;
+        if left > 0.0 {
+            if let Some(ms) = pack_expiry_ms(pack) {
+                earliest = Some(earliest.map_or(ms, |e: i64| e.min(ms)));
+            }
+        }
+    }
+    EntUsage {
+        remaining: if has_quota && !unlimited {
+            Some(remaining.round() as i64)
+        } else {
+            None
+        },
+        unlimited,
+        earliest_expiry_ms: earliest,
+    }
+}
+
+/// 抓取账号「已有积分」（best-effort）。⚠️ 会发一次网络请求，调用方负责缓存/TTL。
+pub async fn fetch_ent_usage(account: &Account) -> Option<EntUsage> {
+    let client = reqwest::Client::new();
+    fetch_ent_usage_with(&client, account).await
+}
+
+/// 同 [`fetch_ent_usage`]，但复用外部 `client` 的连接池。
+pub async fn fetch_ent_usage_with(client: &reqwest::Client, account: &Account) -> Option<EntUsage> {
+    let host = normalize_host(&host_of(account));
+    let (auth_hdr, hdrs) = headers(account);
+    let url = format!("{host}{ENT_USAGE_PATH}");
+    let mut req = client
+        .post(&url)
+        .header("Authorization", &auth_hdr)
+        .body(format!(
+            "{{\"require_usage\":true,\"req_source\":{REQ_SOURCE_LITE}}}"
+        ))
+        .timeout(Duration::from_secs(15));
+    for (k, v) in &hdrs {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.ok()?;
+    let v = resp.json::<Value>().await.ok()?;
+    // 官方判定：响应存在且 `code` 缺省或为 0 才算成功（正常响应里没有 `code` 字段）
+    match v.get("code").and_then(Value::as_i64) {
+        None | Some(0) => Some(parse_ent_usage(&v)),
+        Some(_) => None,
+    }
+}
+
+/// 抓取积分快照（best-effort）：**账号已有积分** + 到期时间，供界面展示与接管选号。
+///
+/// **失败也要落一个空快照**，否则每次新会话都会重打一次接口。
+/// 调用方若已有快照，应保留原有数值（见 `commands::checkin_status` / `proxy::choose_account`）。
+pub async fn fetch_credit_snapshot(
+    client: &reqwest::Client,
+    account: &Account,
+) -> crate::accounts::CreditSnapshot {
+    match fetch_ent_usage_with(client, account).await {
+        Some(u) => {
+            crate::accounts::CreditSnapshot::now(u.remaining, u.unlimited, u.earliest_expiry_ms)
+        }
+        None => crate::accounts::CreditSnapshot::now(None, false, None),
+    }
+}
+
+/// 对一个账号执行签到。
 pub async fn do_checkin(account: &Account) -> CheckinResult {
     let client = reqwest::Client::new();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let host = normalize_host(&host_of(account));
-    let mut last: Option<String> = None;
-
     let (auth_hdr, hdrs) = headers(account);
+    let body = claim_body();
 
-    // 优先查状态：今日已签 → 幂等成功；未开启 → 非活动；否则才去领取
-    let status_url = format!("{}{}", host, STATUS_PATHS[0]);
-    let mut status_req = client
-        .post(&status_url)
-        .header("Authorization", &auth_hdr)
-        .body("{}")
-        .timeout(Duration::from_secs(15));
-    for (k, v) in &hdrs {
-        status_req = status_req.header(k, v);
-    }
-    let status = status_req.send().await.ok();
-    if let Some(st) = status {
-        if let Ok(v) = st.json::<Value>().await {
-            let (checked_in, enable, credits) = status_fields(&v);
-            let code = v.get("code").and_then(Value::as_i64);
-            if code == Some(0) {
-                if checked_in {
-                    return CheckinResult {
-                        success: true,
-                        already: true,
-                        inactive: false,
-                        message: "今日已签到".into(),
-                        credit: credits,
-                        host: Some(host.clone()),
-                        at: now,
-                    };
-                }
-                if !enable {
-                    return CheckinResult {
-                        success: false,
-                        already: false,
-                        inactive: true,
-                        message: "签到活动未开启".into(),
-                        credit: None,
-                        host: Some(host.clone()),
-                        at: now,
-                    };
-                }
-            }
+    // ---- 1) 先查状态：今日已签 → 幂等成功；活动未开启 → 直接返回 ----
+    if let Some(v) = query_status(account).await {
+        let (checked_in, enable, credits) = status_fields(&v);
+        if checked_in {
+            return CheckinResult {
+                success: true,
+                already: true,
+                inactive: false,
+                transient: false,
+                auth_failed: false,
+                message: "今日已签到".into(),
+                credit: credits,
+                host: Some(host.clone()),
+                at: now,
+            };
+        }
+        if !enable {
+            return CheckinResult {
+                success: false,
+                already: false,
+                inactive: true,
+                transient: false,
+                auth_failed: false,
+                message: "签到活动未开启".into(),
+                credit: credits,
+                host: Some(host.clone()),
+                at: now,
+            };
         }
     }
 
-    // 未命中明确状态，直接尝试领取（每个候选路径做有限重试，应对 9074 限流）
-    const MAX_CLAIM_ATTEMPTS: usize = 3;
-    for path in CLAIM_PATHS {
-        let url = format!("{}{}", host, path);
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            let mut req = client
-                .post(&url)
-                .header("Authorization", &auth_hdr)
-                .body("{}")
-                .timeout(Duration::from_secs(20));
-            for (k, v) in &hdrs {
-                req = req.header(k, v);
+    // ---- 2) 领取：递增退避重试（9074 是服务端限流，需等它放行）----
+    let url = format!("{host}{CLAIM_PATH}");
+    let mut last_msg = String::new();
+    let mut last_code: Option<i64> = None;
+    let mut last_transient = false;
+    let mut last_auth = false;
+
+    for delay in CLAIM_BACKOFF_SECS.iter() {
+        if *delay > 0 {
+            tokio::time::sleep(Duration::from_secs(*delay)).await;
+        }
+        let mut req = client
+            .post(&url)
+            .header("Authorization", &auth_hdr)
+            .body(body.clone())
+            .timeout(Duration::from_secs(25));
+        for (k, v) in &hdrs {
+            req = req.header(k, v);
+        }
+
+        let (http_ok, code, msg, raw) = match req.send().await {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                let code = parsed.get("code").and_then(Value::as_i64);
+                let msg = msg_of(&parsed);
+                (status.is_success(), code, msg, text)
             }
-            match req.send().await {
-                Ok(r) => {
-                    let status = r.status();
-                    let http_ok = status.is_success();
-                    let text = r.text().await.unwrap_or_default();
-                    let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                    let code = body.get("code").and_then(Value::as_i64);
-                    let mut msg = body
-                        .get("msg")
-                        .or_else(|| body.get("message"))
-                        .or_else(|| body.get("error"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    // 诊断兜底：把 HTTP 状态码 + 业务 code + 原始响应体带进消息，避免下次再盲猜
-                    let detail = if text.trim().is_empty() {
-                        format!("HTTP {}", status.as_u16())
-                    } else {
-                        format!(
-                            "HTTP {} code={:?} {}",
-                            status.as_u16(),
-                            code,
-                            text.trim().chars().take(160).collect::<String>()
-                        )
-                    };
-                    if msg.is_empty() {
-                        msg = detail.clone();
-                    }
-                    let (ok, already, inactive) = classify(http_ok, code, &msg);
-                    if ok || already || inactive || code == Some(0) {
-                        return CheckinResult {
-                            success: ok || code == Some(0),
-                            already,
-                            inactive,
-                            message: msg,
-                            credit: parse_credit(&body),
-                            host: Some(host.clone()),
-                            at: now,
-                        };
-                    }
-                    // 限流/繁忙：退避后重试（同路径），其余失败直接换下一路径
-                    if is_transient_busy(code, &msg) && attempt < MAX_CLAIM_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    last = Some(format!("[HTTP {} code={:?}] {}", status.as_u16(), code, msg));
-                    break;
-                }
-                Err(e) => {
-                    last = Some(format!("{} 请求失败：{}", url, e));
-                    break;
-                }
-            }
+            Err(e) => (false, None, e.to_string(), String::new()),
+        };
+
+        // 成功（含幂等重复领取）
+        if code == Some(0) {
+            let credit = serde_json::from_str::<Value>(&raw).ok().and_then(|v| parse_credit(&v));
+            let msg = if msg.is_empty() { "success".into() } else { msg };
+            return CheckinResult {
+                success: true,
+                already: false,
+                inactive: false,
+                transient: false,
+                auth_failed: false,
+                message: msg,
+                credit,
+                host: Some(host.clone()),
+                at: now,
+            };
+        }
+
+        // 已签到文案（业务上用非 0 code 表达）
+        if ALREADY_RE.is_match(&msg) {
+            return CheckinResult {
+                success: true,
+                already: true,
+                inactive: false,
+                transient: false,
+                auth_failed: false,
+                message: msg,
+                credit: None,
+                host: Some(host.clone()),
+                at: now,
+            };
+        }
+
+        // 活动未开启/已结束：非错误，直接返回
+        if INACTIVE_RE.is_match(&msg) {
+            return CheckinResult {
+                success: false,
+                already: false,
+                inactive: true,
+                transient: false,
+                auth_failed: false,
+                message: msg,
+                credit: None,
+                host: Some(host.clone()),
+                at: now,
+            };
+        }
+
+        last_code = code;
+        last_msg = if msg.is_empty() {
+            format!("HTTP {} {}", if http_ok { 200 } else { 0 }, raw.trim())
+        } else {
+            msg.clone()
+        };
+        last_transient = is_transient(code, &last_msg) || !http_ok;
+        last_auth = is_auth_error(code, &last_msg);
+
+        // 鉴权失败重试没有意义，直接结束
+        if last_auth {
+            break;
+        }
+        // 非瞬时失败（真业务错误）也没必要继续退避
+        if !last_transient {
+            break;
         }
     }
+
+    // ---- 3) 组装失败结果（带可读原因 + 是否需要重试）----
+    let message = if last_auth {
+        format!("鉴权失败（code {:?}）：{}；请重新登录该账号以刷新 token", last_code, last_msg)
+    } else if last_transient {
+        format!(
+            "服务端限流未放行（code {:?}）：{}；已按 5 次退避重试仍未成功，稍后会自动再试",
+            last_code, last_msg
+        )
+    } else {
+        format!("[code={:?}] {}", last_code, last_msg)
+    };
 
     CheckinResult {
         success: false,
         already: false,
         inactive: false,
-        message: last.unwrap_or_else(|| "所有候选路径均失败".into()),
+        transient: last_transient,
+        auth_failed: last_auth,
+        message,
         credit: None,
         host: None,
         at: now,
     }
 }
 
-/// 查询签到状态：返回本体（含 `checked_in`/`credits` 等顶层字段），前端可直接渲染。
-/// 失败返回 None。best-effort。
-pub async fn query_status(account: &Account) -> Option<Value> {
-    let client = reqwest::Client::new();
-    let host = normalize_host(&host_of(account));
-    let (auth_hdr, hdrs) = headers(account);
-    let url = format!("{}{}", host, STATUS_PATHS[0]);
-    let mut req = client
-        .post(&url)
-        .header("Authorization", &auth_hdr)
-        .body("{}")
-        .timeout(Duration::from_secs(15));
-    for (k, v) in &hdrs {
-        req = req.header(k, v);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_is_official_shape() {
+        assert_eq!(claim_body(), r#"{"req_source":2}"#);
     }
-    if let Ok(resp) = req.send().await {
-        if let Ok(v) = resp.json::<Value>().await {
-            if v.get("code").and_then(Value::as_i64) == Some(0) {
-                return Some(v);
-            }
-        }
+
+    #[test]
+    fn status_fields_reads_official_payload() {
+        let v: Value = serde_json::from_str(
+            r#"{"checked_in":false,"code":0,"credits":150,"did_checked_in":false,"enable":true,"extra_credits":50,"message":"success"}"#,
+        )
+        .unwrap();
+        let (checked_in, enable, credits) = status_fields(&v);
+        assert!(!checked_in);
+        assert!(enable);
+        assert_eq!(credits, Some(150), "取 credits 原值，不合并 extra_credits");
     }
-    None
+
+    #[test]
+    fn transient_and_auth_classification() {
+        assert!(is_transient(Some(9074), "当前参与用户太多，请稍后再试"));
+        assert!(!is_transient(Some(0), "success"));
+        assert!(is_auth_error(Some(1001), "not able to authenticate you"));
+        assert!(!is_auth_error(Some(9074), "too many"));
+    }
+
+    #[test]
+    fn device_id_prefers_user_id() {
+        let acc = Account {
+            id: "local".into(),
+            name: String::new(),
+            phone: None,
+            region: None,
+            user_id: Some("u123".into()),
+            token: "t".into(),
+            refresh_token: None,
+            host: None,
+            expires_at: None,
+            refresh_expires_at: None,
+            device_id: Some("dev".into()),
+            machine_id: Some("mach".into()),
+            created_at: String::new(),
+            credit_snapshot: None,
+        };
+        assert_eq!(device_id(&acc), "u123");
+    }
+
+    #[test]
+    fn to_ms_accepts_seconds_millis_and_strings() {
+        // 秒级时间戳 → 放大到毫秒
+        assert_eq!(to_ms(&Value::from(1_700_000_000i64)), Some(1_700_000_000_000));
+        // 毫秒级原样保留
+        assert_eq!(to_ms(&Value::from(1_700_000_000_000i64)), Some(1_700_000_000_000));
+        // 字符串数字
+        assert_eq!(to_ms(&Value::from("1700000000")), Some(1_700_000_000_000));
+        // 日期时间串 / ISO
+        assert!(to_ms(&Value::from("2026-12-31 23:59:59")).is_some());
+        assert!(to_ms(&Value::from("not a time")).is_none());
+    }
+
+    /// 用 2026-09-14 实机抓到的真实响应（6 个额度包）核对汇总口径。
+    #[test]
+    fn ent_usage_matches_official_aggregation() {
+        let real = r#"{
+          "is_credits_billing": true,
+          "user_entitlement_pack_list": [
+            {"display_desc":"老用户福利","expire_time":1791979006,
+             "entitlement_base_info":{"quota":{"credits_limit":2000},"end_time":1791979006},"usage":{}},
+            {"display_desc":"老用户福利","expire_time":1791979006,
+             "entitlement_base_info":{"quota":{"credits_limit":2000},"end_time":1791979006},
+             "usage":{"credits_amount":579.3308}},
+            {"display_desc":"免费","expire_time":1790783999,
+             "entitlement_base_info":{"quota":{"solo_agent_parallel_limit":2},"end_time":1790783999},
+             "usage":{}},
+            {"display_desc":"每月登录赠送","expire_time":1790783999,
+             "entitlement_base_info":{"quota":{"credits_limit":500},"end_time":1790783999},
+             "usage":{"credits_amount":500}},
+            {"display_desc":"签到奖励","expire_time":1791979013,
+             "entitlement_base_info":{"quota":{"credits_limit":150},"end_time":1791979013},"usage":{}},
+            {"display_desc":"签到奖励","expire_time":1792057191,
+             "entitlement_base_info":{"quota":{"credits_limit":150},"end_time":1792057191},"usage":{}}
+          ]
+        }"#;
+        let u = parse_ent_usage(&serde_json::from_str::<Value>(real).unwrap());
+        // 2000 + (2000 − 579.3308) + 150 + 150 = 3720.6692 → 3721
+        assert_eq!(u.remaining, Some(3721), "按官方 hHe() 汇总剩余额度并四舍五入到整数");
+        assert!(!u.unlimited);
+        assert_eq!(
+            u.earliest_expiry_ms,
+            Some(1_791_979_006_000),
+            "秒级 expire_time 应放大到毫秒；已用尽的包不参与「到期最早」"
+        );
+        // 账号已有积分 ≠ 签到奖励（签到给 150，这里是 3721）
+        assert_ne!(u.remaining, Some(150));
+    }
+
+    #[test]
+    fn ent_usage_handles_unlimited_and_malformed() {
+        let unlimited = serde_json::from_str::<Value>(
+            r#"{"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":-1}}}]}"#,
+        )
+        .unwrap();
+        let u = parse_ent_usage(&unlimited);
+        assert!(u.unlimited, "credits_limit = -1 视为不限量");
+        assert_eq!(u.remaining, None, "不限量时不给数字（由 unlimited 表达）");
+
+        // 异常响应不 panic，也不编造数字
+        assert_eq!(parse_ent_usage(&Value::from(0)).remaining, None);
+        let no_list = serde_json::from_str::<Value>(r#"{"code":0}"#).unwrap();
+        assert_eq!(parse_ent_usage(&no_list).remaining, None);
+        let empty = serde_json::from_str::<Value>(r#"{"user_entitlement_pack_list":[]}"#).unwrap();
+        assert_eq!(parse_ent_usage(&empty).remaining, None);
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +752,7 @@ mod real_tests {
             device_id: a.device_id.clone(),
             machine_id: a.machine_id.clone(),
             created_at: String::new(),
-            enabled: true,
+            credit_snapshot: None,
         }
     }
 
@@ -346,14 +761,17 @@ mod real_tests {
     fn live_status_and_checkin() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            println!("app_version={}", app_version());
             let list = trae_auth::discover_local_accounts();
             println!("accounts={}", list.len());
             for a in list {
                 let acc = to_account(&a);
                 let _status = query_status(&acc).await;
                 let r = do_checkin(&acc).await;
-                println!("CHECKIN success={} already={} inactive={} credit={:?} msg={:?}",
-                    r.success, r.already, r.inactive, r.credit, r.message);
+                println!(
+                    "CHECKIN success={} already={} inactive={} transient={} auth={} credit={:?} msg={:?}",
+                    r.success, r.already, r.inactive, r.transient, r.auth_failed, r.credit, r.message
+                );
             }
         });
     }
