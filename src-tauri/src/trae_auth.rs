@@ -131,9 +131,15 @@ fn storage_paths() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        if let Some(local) = dirs::data_local_dir() {
-            for app in ["TRAE SOLO CN", "TRAE", "Trae TRAE", "TRAE CN"] {
-                roots.push(local.join(app).join("User").join("globalStorage"));
+        // TraeWork 桌面端把 userData 落在 %APPDATA%（Roaming）；少数场景也可能出现在
+        // %LOCALAPPDATA%（Local）。两个根都扫，避免漏掉本机登录态。
+        let bases: Vec<PathBuf> = [dirs::data_dir(), dirs::data_local_dir()]
+            .into_iter()
+            .flatten()
+            .collect();
+        for base in bases {
+            for app in ["TRAE SOLO CN", "Trae CN", "TRAE CN", "TRAE", "Trae TRAE"] {
+                roots.push(base.join(app).join("User").join("globalStorage"));
             }
         }
     }
@@ -184,10 +190,10 @@ fn parse_storage(path: &Path) -> Option<TraeLocalAccount> {
         .and_then(|r| str_at(r, "region"))
         .or_else(|| account.and_then(|a| str_at(a, "region")));
 
-    // 设备/机器标识在 storage.json 顶层 `telemetry` 里（与登录态 blob 平级），签到接口必填头来源
-    let telemetry = json.get("telemetry");
-    let machine_id = telemetry.and_then(|t| str_at(t, "machineId"));
-    let device_id = telemetry.and_then(|t| str_at(t, "devDeviceId"));
+    // 设备/机器标识在 storage.json 顶层，以**点号平铺键**存在（不是嵌套对象）：
+    // "telemetry.machineId" / "telemetry.devDeviceId"，是签到接口必填头 X-Machine-Id / X-Device-Id 的来源
+    let machine_id = str_at(&json, "telemetry.machineId");
+    let device_id = str_at(&json, "telemetry.devDeviceId");
 
     Some(TraeLocalAccount {
         user_id: str_at(&data, "userId"),
