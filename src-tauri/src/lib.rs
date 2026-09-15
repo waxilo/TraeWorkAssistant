@@ -25,19 +25,24 @@ use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Tauri updater 的 reqwest 默认走系统代理；本机代理（如 Clash）对 GitHub release-assets
-    // CDN 不稳定（HTTP 000 / 502），会导致 latest.json 都拉不下来。
-    // 启动时把 GitHub 相关域名加入 NO_PROXY，让更新器直连 GitHub。
-    const GITHUB_NO_PROXY: &str = "github.com,.github.com,githubusercontent.com,.githubusercontent.com";
-    match std::env::var("NO_PROXY") {
-        Ok(v) if !v.is_empty() => {
-            std::env::set_var("NO_PROXY", format!("{}, {}", v, GITHUB_NO_PROXY));
-        }
-        _ => {
-            std::env::set_var("NO_PROXY", GITHUB_NO_PROXY);
-        }
-    }
-
+    // ⚠️ 这里**故意什么都不做**：曾经在这里注入
+    // `NO_PROXY=github.com,.github.com,githubusercontent.com,…` 让更新器「绕开代理直连 GitHub」，
+    // 已于 2026-09-15 删除。旧注释的前提（「本机代理对 GitHub CDN 不稳」）不但过时，而且反了：
+    //
+    // 1. updater 插件用的是 reqwest 0.13，它的 `system-proxy` 特性**默认开启**，在 macOS 上会
+    //    自己读「系统代理」（hyper-util → SystemConfiguration 的 HTTP(S)Proxy）。只要系统代理开着，
+    //    更新器**本来就走代理**，根本不需要我们插手；
+    // 2. reqwest 在每次请求前会**先查 `NO_PROXY`**（`Matcher::intercept()` 的第一句就是它），
+    //    命中就直接连 —— 也就是说那段注入把自己刚接上的代理又排除了；
+    // 3. 而本机**直连 `github.com` 已被掐死**（DNS 给 20.205.243.166，443 TCP 超时；同一时刻
+    //    `api.github.com` 反而直连 200）。而插件没设超时 ⇒ 症状是「界面卡在『正在检查更新…』
+    //    约 75s 才报错」。
+    //
+    // 实测（2026-09-15 23:1x）：经 Clash(`127.0.0.1:7897`) 同一条
+    // `releases/latest/download/latest.json` **0.6s 返回 302**，直连 8s / 20s 均无响应。
+    //
+    // ⇒ 要让某些域名不走代理，请在**系统代理的 bypass 列表**里配；不要在这里写 `NO_PROXY`，
+    //   那会连系统代理一起排除掉，而系统代理是更新器唯一的出路。
     let app = tauri::Builder::default()
         // **必须第一个注册**：单实例守卫生效时，后起的实例会在此直接退出，
         // 根本走不到 `setup()`，也就不会去抢反代端口、不会碰 TraeWork。
