@@ -36,10 +36,19 @@
 //!
 //! ## 9074 的处理（这是「签到老是失败」的真正原因）
 //!
-//! 实测：账号状态正常（`enable:true, checked_in:false, code:0`），但 `claim` 会**持续**
-//! 返回 9074 —— 与请求体、设备头、`req_source` 取值**均无关**（已逐项对照验证），
-//! 是服务端对领取接口的**限流/排队**，过一段时间会自行放行。
-//! 因此这里采用**递增退避 + 多轮重试**，而不是「试一次就写个失败」。
+//! ⚠️ **2026-09-14 更正**：9074 的提示语（「当前参与用户太多，请稍后再试」）有误导性，
+//! 它**不只是**排队/限流，更是服务端对**不认识的设备号**的通用拒绝。实测对照（同一 token、
+//! 同一请求体、只换 `x-device-id`）：
+//!
+//! ```text
+//! x-device-id = 授权时随机生成的 uuid  → {"code":9074,...}   ❌ 持续失败
+//! x-device-id = 账号 uid（同一秒发）   → {"code":0,"message":"success"} ✅
+//! ```
+//!
+//! 因此设备号必须取「服务端认识的账号身份」或「本机真实设备号」，见 [`device_id`]。
+//! 另外**不要**因为 9074 就无限等待：它既可能是真排队、也可能是设备号不被接受，
+//! 所以这里仍是「递增退避 + 多轮重试」（5 次 / 约 75 秒）而不是试一次就写失败——
+//! 真排队时会等到放行，设备号错时失败信息里会带上实际用的 `x-device-id` 便于定位。
 //!
 //! 注：领取成功后重复调用同样返回 `{"code":0,"message":"success"}`（幂等），
 //! 所以重试不会重复发放。
@@ -104,6 +113,11 @@ pub struct AccountStatus {
     pub credits: Option<i64>,
     /// 不限量
     pub unlimited: bool,
+    /// 「还有余量的额度包」里最早的到期时间（毫秒）；未知为 `None`。
+    ///
+    /// 它就是「智能接管」选号的**第一排序键**（到期最早者优先，见 `proxy::pick_index`），
+    /// 所以必须露到界面上，否则用户无法核对这条规则是否生效。
+    pub earliest_expiry_ms: Option<i64>,
     pub message: String,
 }
 
@@ -117,14 +131,14 @@ pub fn message_of(v: &Value) -> String {
     msg_of(v)
 }
 
-fn host_of(account: &Account) -> String {
+pub(crate) fn host_of(account: &Account) -> String {
     account
         .host
         .clone()
         .unwrap_or_else(|| "https://api.trae.cn".into())
 }
 
-fn normalize_host(url: &str) -> String {
+pub(crate) fn normalize_host(url: &str) -> String {
     let u = url.trim().trim_end_matches('/');
     if u.starts_with("http://") || u.starts_with("https://") {
         u.to_string()
@@ -151,15 +165,31 @@ pub fn app_version() -> String {
     CACHE.clone()
 }
 
-/// 设备标识。优先用 `user_id`（真实账号身份，服务端必然认识），
-/// 退回设备/机器标识，最后用本地账号记录 id。
-fn device_id(account: &Account) -> String {
-    account
-        .user_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| account.device_id.clone())
-        .or_else(|| account.machine_id.clone())
+/// 设备标识 —— `x-device-id` 的唯一来源。
+///
+/// 顺序（2026-09-14 逐项实测确定，**不是**拍脑袋的优先级）：
+///
+/// | `x-device-id` 取值 | `claim` 结果 |
+/// | --- | --- |
+/// | 账号 uid（`user_id` / JWT `data.id`） | `{"code":0,"message":"success"}` ✅ |
+/// | 本机 TraeWork 的 `telemetry.devDeviceId` | 官方客户端同源，可信 |
+/// | 浏览器登录时随机生成的 uuid | `{"code":9074,"message":"当前参与用户太多，请稍后再试"}` ❌ |
+///
+/// 也就是说：**9074 不是「稍后再试」的排队，而是服务端不认识这个设备号**。
+/// 新账号（浏览器登录）此前正是因为落库里存着那个随机 uuid，签到永远签不上。
+///
+/// ⚠️ 所以这里**刻意不读 `account.device_id`**：它对「扫描本机登录」导入的账号是真实的
+/// `devDeviceId`，对「浏览器登录」的账号却是随机值，两者无法区分。改用下面的
+/// [`crate::trae_auth::local_device_identity`] 取「本机真实设备号」，语义与账号来源无关。
+pub fn device_id(account: &Account) -> String {
+    let clean =
+        |s: Option<String>| s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    clean(account.user_id.clone())
+        // uid 缺失（GetUserInfo 对授权码换来的 token 直接 401）时，从 JWT 载荷里解
+        .or_else(|| crate::token::user_id(&account.token))
+        // 本机真实设备号：与官方客户端同一个值，一台机器一个
+        .or_else(|| clean(crate::trae_auth::local_device_identity().0))
+        .or_else(|| clean(account.machine_id.clone()))
         .unwrap_or_else(|| account.id.clone())
 }
 
@@ -174,10 +204,12 @@ fn device_type() -> &'static str {
 }
 
 /// 请求头：`Cloud-IDE-JWT` 鉴权 + 官方设备头（小写 `x-*`）。
-fn headers(account: &Account) -> (String, Vec<(String, String)>) {
+///
+/// `dev` 由调用方传入（一次操作里只解析一次，见 [`device_id`]）。
+fn headers(account: &Account, dev: &str) -> (String, Vec<(String, String)>) {
     let hdrs: Vec<(String, String)> = vec![
         ("Content-Type".into(), "application/json".into()),
-        ("x-device-id".into(), device_id(account)),
+        ("x-device-id".into(), dev.to_string()),
         ("x-device-type".into(), device_type().into()),
         ("x-app-version".into(), app_version()),
     ];
@@ -271,7 +303,7 @@ pub async fn query_status(account: &Account) -> Option<Value> {
 /// 复用连接池避免每个账号都新建一次客户端）。
 pub async fn query_status_with(client: &reqwest::Client, account: &Account) -> Option<Value> {
     let host = normalize_host(&host_of(account));
-    let (auth_hdr, hdrs) = headers(account);
+    let (auth_hdr, hdrs) = headers(account, &device_id(account));
     let url = format!("{host}{STATUS_PATH}");
     let mut req = client
         .post(&url)
@@ -414,7 +446,7 @@ pub async fn fetch_ent_usage(account: &Account) -> Option<EntUsage> {
 /// 同 [`fetch_ent_usage`]，但复用外部 `client` 的连接池。
 pub async fn fetch_ent_usage_with(client: &reqwest::Client, account: &Account) -> Option<EntUsage> {
     let host = normalize_host(&host_of(account));
-    let (auth_hdr, hdrs) = headers(account);
+    let (auth_hdr, hdrs) = headers(account, &device_id(account));
     let url = format!("{host}{ENT_USAGE_PATH}");
     let mut req = client
         .post(&url)
@@ -456,7 +488,8 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
     let client = reqwest::Client::new();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let host = normalize_host(&host_of(account));
-    let (auth_hdr, hdrs) = headers(account);
+    let dev = device_id(account);
+    let (auth_hdr, hdrs) = headers(account, &dev);
     let body = claim_body();
 
     // ---- 1) 先查状态：今日已签 → 幂等成功；活动未开启 → 直接返回 ----
@@ -589,15 +622,17 @@ pub async fn do_checkin(account: &Account) -> CheckinResult {
     }
 
     // ---- 3) 组装失败结果（带可读原因 + 是否需要重试）----
+    // 9074 有两副面孔：真排队（等一会儿会放行）与「设备号不被接受」（重试永远无效）。
+    // 提示语里带上实际用的 x-device-id，下次排障一眼就能看出是哪种。
     let message = if last_auth {
         format!("鉴权失败（code {:?}）：{}；请重新登录该账号以刷新 token", last_code, last_msg)
     } else if last_transient {
         format!(
-            "服务端限流未放行（code {:?}）：{}；已按 5 次退避重试仍未成功，稍后会自动再试",
-            last_code, last_msg
+            "服务端未放行（code {:?}）：{}；已按 5 次退避重试仍未成功（x-device-id={}）",
+            last_code, last_msg, dev
         )
     } else {
-        format!("[code={:?}] {}", last_code, last_msg)
+        format!("[code={:?}] {}（x-device-id={}）", last_code, last_msg, dev)
     };
 
     CheckinResult {
@@ -661,6 +696,47 @@ mod tests {
             credit_snapshot: None,
         };
         assert_eq!(device_id(&acc), "u123");
+    }
+
+    fn acc_with(user_id: Option<&str>, token: &str, device_id: Option<&str>) -> Account {
+        Account {
+            id: "local".into(),
+            name: String::new(),
+            phone: None,
+            region: None,
+            user_id: user_id.map(str::to_string),
+            token: token.to_string(),
+            refresh_token: None,
+            host: None,
+            expires_at: None,
+            refresh_expires_at: None,
+            device_id: device_id.map(str::to_string),
+            machine_id: Some("mach".into()),
+            created_at: String::new(),
+            credit_snapshot: None,
+        }
+    }
+
+    /// 回归（2026-09-14「新加的号签不上」）：uid 缺失时从 **JWT 载荷**取 uid
+    /// （`GetUserInfo` 对授权码换来的 token 会 401，不能依赖它）。
+    #[test]
+    fn device_id_falls_back_to_uid_inside_jwt() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"data":{"id":"3225324630062683"}}"#);
+        let token = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.sig");
+        let acc = acc_with(None, &token, Some("e6fb29121995483988b3f6cff4b9ff1c"));
+        assert_eq!(device_id(&acc), "3225324630062683");
+    }
+
+    /// 回归：浏览器登录流程落库的**随机 device_id** 绝不能再被当成签到头
+    /// ——服务端不认识它，`claim` 会一直回 9074。
+    #[test]
+    fn device_id_never_uses_the_random_stored_device_id() {
+        let random = "e6fb29121995483988b3f6cff4b9ff1c";
+        // user_id 缺失 + token 不是 JWT：应当退到本机真实设备号 / machine_id / id
+        let acc = acc_with(None, "opaque-token", Some(random));
+        assert_ne!(device_id(&acc), random);
     }
 
     #[test]
@@ -736,6 +812,32 @@ mod real_tests {
     use super::*;
     use crate::accounts::Account;
     use crate::trae_auth;
+
+    /// 排障用（只读 + 顺手规范化）：打印账号池里每个账号**实际会用的签到头 `x-device-id`**。
+    ///
+    /// 下次「某个号又签不上」时先跑它 —— 若打印出的值不是 uid、也不是本机真实设备号，
+    /// 那就是设备号问题（服务端会对它回 9074）：
+    /// `cargo test --lib -- --ignored --nocapture dump_checkin_device_ids`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn dump_checkin_device_ids() {
+        let dir = dirs::home_dir()
+            .expect("home")
+            .join("Library/Application Support/cn.traework.assistant");
+        let list = crate::accounts::load_accounts(&dir);
+        let (dev, mach) = trae_auth::local_device_identity();
+        println!("本机 telemetry: devDeviceId={dev:?} machineId={mach:?}");
+        for a in &list {
+            println!(
+                "账号 id={:?} uid={:?} 落库device_id={:?} → x-device-id={:?}",
+                a.id,
+                a.user_id,
+                a.device_id,
+                device_id(a)
+            );
+        }
+    }
 
     fn to_account(a: &trae_auth::TraeLocalAccount) -> Account {
         Account {

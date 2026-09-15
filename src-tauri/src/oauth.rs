@@ -13,7 +13,9 @@
 //!   4. 用户在页面登录后，浏览器重定向到本地回调并携带 `authCodeInfo`(JSON，含 AuthCode)
 //!   5. 用 AuthCode + CodeVerifier 换到 `Cloud-IDE-JWT`：
 //!       `POST {apiHost}/trae/api/v3/oauth/ExchangeToken`
-//!   6. 拉账号信息：`POST {apiHost}/cloudide/api/v3/trae/GetUserInfo`（Cloud-IDE-JWT 头）
+//!   6. 拉账号信息：`POST {apiHost}/cloudide/api/v3/trae/GetUserInfo`
+//!      —— **鉴权头是 `x-cloudide-token: <JWT>`，不是 `Authorization: Cloud-IDE-JWT`**
+//!      （后者对这个接口一律 401 `20310 The user is not logged in`，见 [`fetch_user_info`]）
 //!
 //! 相比「扫描本机 / 导入文件」：这两条只能拿到本机**已登录过**的账号，而这里能主动
 //! 签发**任意新账号**的凭证；代价是需要用户在浏览器里完成一次授权。
@@ -30,20 +32,20 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::devicekey;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use p256::ecdsa::SigningKey;
-use p256::pkcs8::{EncodePublicKey, LineEnding};
-use rand::rngs::OsRng;
 
-/// SOLO 精简版消费端 client_id（逆向自 main.js `Fb()`）
-const CLIENT_ID_SOLO: &str = "en1oxy7wnw8j9n";
-/// 授权码换 token
-const EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
+/// SOLO 精简版消费端 client_id（逆向自 main.js `Fb()`）。
+/// 续签（[`crate::renew`]）也用同一个 client_id —— 服务端按 client 校验。
+pub(crate) const CLIENT_ID_SOLO: &str = "en1oxy7wnw8j9n";
+/// 授权码换 token（**auth-code 与 refresh-token 两种授权共用同一端点**）
+pub(crate) const EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
 /// 拉账号信息
 const GET_USER_INFO_PATH: &str = "/cloudide/api/v3/trae/GetUserInfo";
 /// 本地回调路由（前端轮询期间浏览器只回打这里一次）
@@ -166,22 +168,45 @@ fn region_for_host(host: &str) -> Option<String> {
     }
 }
 
+/// 账号上存的 `host`（可能是空串 / 裸域名 / 完整 URL）→ 规范化后的 api host。
+/// 缺省国内版。续签要用它拼 `ExchangeToken` 地址。
+pub fn normalize_api_host(host: &str) -> String {
+    let raw = host.trim().to_lowercase();
+    if raw.contains("trae.ai") || raw.contains("trae.com") {
+        "https://api.trae.ai".to_string()
+    } else {
+        "https://api.trae.cn".to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 设备身份
 // ---------------------------------------------------------------------------
 
-/// 设备身份 (device_id, machine_id)：一次进程内固定，授权与换 token 必须一致。
-/// 服务端按此校验「Token device not match」——换 token 时随机生成必然对不上。
-static DEVICE: OnceLock<(String, String)> = OnceLock::new();
+/// 应用数据目录。设备密钥对与设备号要落盘（见 [`crate::devicekey`]），
+/// 所以这两个函数需要知道数据目录；由 `lib.rs` 在 setup 时注入。
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+fn data_dir() -> PathBuf {
+    DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::temp_dir().join("traework-assistant"))
+}
+
+/// 设备身份 (device_id, machine_id)：**落盘持久化**，一次进程内也不会变。
+///
+/// 必须持久化，否则续签必失败：token 绑定「签发时的 DeviceID + 私钥」，
+/// 换一次身份就回 `20403 Token device not match`（详见 [`crate::renew`] 顶部对照表）。
+/// 首次生成时优先用本机 TraeWork 的真实设备号（官方语义：一台机器一个设备号）。
 fn device_identity() -> (String, String) {
-    DEVICE
-        .get_or_init(|| {
-            (
-                uuid::Uuid::new_v4().simple().to_string(),
-                uuid::Uuid::new_v4().simple().to_string(),
-            )
-        })
-        .clone()
+    let (dev, mach) = crate::trae_auth::local_device_identity();
+    let id = crate::devicekey::load_or_create(&data_dir(), dev, mach);
+    (id.device_id, id.machine_id)
 }
 
 /// 设备名：best-effort 取 hostname，失败给占位（仅提示用，不影响校验）。
@@ -194,21 +219,11 @@ fn device_name() -> String {
         .unwrap_or_else(|| "TraeWorkAssistant-Device".into())
 }
 
-/// 设备公钥（SPKI PEM）：进程内生成一次（对齐真实客户端 `wTe()` 的 P-256 密钥对），
-/// 供 `DeviceInfo.DevicePublicKey` 完成设备绑定——auth-code 换 token 只需公钥，
-/// 不需要 `DeviceProof` 签名（那是 refresh 流程才用的）。
-static DEVICE_PUB_KEY: OnceLock<String> = OnceLock::new();
+/// 设备公钥（SPKI PEM）：取自**落盘的**设备密钥对，供 `DeviceInfo.DevicePublicKey`
+/// 完成设备绑定 —— auth-code 换 token 只需公钥；refresh 流程还要用同一把**私钥**签
+/// `DeviceProof`（见 [`crate::renew`]），所以这里绝不能每次现生成一把。
 fn device_public_key() -> String {
-    DEVICE_PUB_KEY
-        .get_or_init(gen_ec_keypair)
-        .clone()
-}
-
-fn gen_ec_keypair() -> String {
-    let sk = SigningKey::random(&mut OsRng);
-    sk.verifying_key()
-        .to_public_key_pem(LineEnding::LF)
-        .unwrap_or_default()
+    devicekey::load_or_create(&data_dir(), None, None).public_key_pem
 }
 
 // ---------------------------------------------------------------------------
@@ -377,20 +392,27 @@ fn parse_exchange_resp(v: &Value) -> Option<ExchangeResult> {
     })
 }
 
-struct UserInfo {
-    uid: String,
-    nickname: Option<String>,
-    phone: Option<String>,
+/// 账号资料（`GetUserInfo` 的 `Result` 子树）
+#[derive(Clone, Debug, Default)]
+pub struct UserInfo {
+    pub uid: String,
+    /// 服务端昵称（`ScreenName`，形如 `用户0044120650`）——**账号名称的唯一真实来源**
+    pub nickname: Option<String>,
+    /// 脱敏手机号（`NonPlainTextMobile`，形如 `191******52`）
+    pub phone: Option<String>,
 }
 
 fn parse_user_info(v: &Value) -> UserInfo {
     let uid = dig_str(v, &["UserID", "userId", "uid", "user_id"]);
     let nickname = {
-        let n = dig_str(v, &["Nickname", "nickname", "name", "uin"]);
+        let n = dig_str(v, &["ScreenName", "Nickname", "nickname", "name", "uin"]);
         if n.is_empty() { None } else { Some(n) }
     };
     let phone = {
-        let p = dig_str(v, &["PhoneNumber", "Phone", "phone", "mobile"]);
+        let p = dig_str(
+            v,
+            &["NonPlainTextMobile", "PhoneNumber", "Phone", "phone", "mobile"],
+        );
         if p.is_empty() { None } else { Some(p) }
     };
     UserInfo { uid, nickname, phone }
@@ -592,31 +614,34 @@ async fn exchange_token(
     })
 }
 
-/// 用 Cloud-IDE-JWT 拉账号信息（失败不致命）
-async fn fetch_user_info(api_host: &str, token: &str, region: Option<&str>) -> UserInfo {
+/// 用 Cloud-IDE-JWT 拉账号资料（昵称 / 脱敏手机号 / uid）。失败返回 `None`（不致命）。
+///
+/// ## 鉴权头是 `x-cloudide-token`，不是 `Authorization`（2026-09-14 实测）
+///
+/// 同一个 token、同一个 body，只换鉴权头，结果天差地别：
+///
+/// | 鉴权头 | 结果 |
+/// |---|---|
+/// | `Authorization: Cloud-IDE-JWT <JWT>` | HTTP 401 `20310 The user is not logged in,` |
+/// | `x-cloudide-token: <JWT>` | HTTP 200，`Result.ScreenName` = 真实昵称 |
+///
+/// 7 种组合（`ReqSource` 取 IDE/Lite、带不带 `X-User-Region`、官方 UA、空 body）用
+/// `Authorization` 全部 401，换成 `x-cloudide-token` 全部 200 —— 与 body、区域头、UA
+/// 都无关，**只由鉴权头决定**。官方客户端里也是这个写法：
+/// `headers: { "x-cloudide-token": token }`。
+pub async fn fetch_user_info(api_host: &str, token: &str) -> Option<UserInfo> {
     let url = format!("{api_host}{GET_USER_INFO_PATH}");
-    let req = http()
-        .ok()
-        .map(|c| c.post(&url).header("Authorization", format!("Cloud-IDE-JWT {token}")));
-    let Some(mut req) = req else {
-        return UserInfo { uid: String::new(), nickname: None, phone: None };
-    };
-    if let Some(r) = region {
-        req = req.header("X-User-Region", r);
-    }
-    match req
-        .json(&serde_json::json!({ "ReqSource": "IDE", "IDEVersion": env!("CARGO_PKG_VERSION") }))
+    let resp = http()
+        .ok()?
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-cloudide-token", token)
+        .json(&serde_json::json!({ "ReqSource": "Lite", "IDEVersion": env!("CARGO_PKG_VERSION") }))
         .send()
         .await
-    {
-        Ok(r) => {
-            let t = r.text().await.unwrap_or_default();
-            serde_json::from_str::<Value>(&t)
-                .map(|v| parse_user_info(&v))
-                .unwrap_or(UserInfo { uid: String::new(), nickname: None, phone: None })
-        }
-        Err(_) => UserInfo { uid: String::new(), nickname: None, phone: None },
-    }
+        .ok()?;
+    let text = resp.text().await.ok()?;
+    serde_json::from_str::<Value>(&text).ok().map(|v| parse_user_info(&v))
 }
 
 /// 第二步：轮询一次授权结果。
@@ -669,7 +694,6 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         return Ok(r);
     };
 
-    let region = region_for_host(&api_host);
     let ex = match exchange_token(&api_host, &client_id, &auth_code, &code_verifier, &device_id, &machine_id).await {
         Ok(ex) => ex,
         Err(e) => {
@@ -680,9 +704,18 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
     };
 
     let info = if ex.apihost.is_empty() {
-        UserInfo { uid: String::new(), nickname: None, phone: None }
+        UserInfo::default()
     } else {
-        fetch_user_info(&ex.apihost, &ex.token, region.as_deref()).await
+        fetch_user_info(&ex.apihost, &ex.token).await.unwrap_or_default()
+    };
+
+    // uid 优先用 GetUserInfo 的结果；该接口拿不到时（离线、限流）退回 JWT 载荷里的 `data.id`。
+    // 这不是「锦上添花」——uid 同时是账号身份与签到头 `x-device-id` 的首选值
+    // （见 `checkin::device_id`），丢了它新号就签不上。
+    let uid = if info.uid.is_empty() {
+        crate::token::user_id(&ex.token)
+    } else {
+        Some(info.uid)
     };
 
     let result = OAuthPoll {
@@ -691,7 +724,7 @@ pub async fn poll(login_id: &str) -> Result<OAuthPoll, String> {
         refresh_token: ex.refresh_token,
         host: Some(ex.apihost.clone()),
         region: region_for_host(&ex.apihost),
-            uid: if info.uid.is_empty() { None } else { Some(info.uid) },
+        uid,
         nickname: info.nickname,
         phone: info.phone,
         expires_at: ex.expires_at,
@@ -811,6 +844,24 @@ mod tests {
         assert_eq!(u.uid, "u-1");
         assert_eq!(u.nickname.as_deref(), Some("waxiloao"));
         assert_eq!(u.phone.as_deref(), Some("190****9775"));
+    }
+
+    /// 真实响应形状（2026-09-14 实测 `GetUserInfo` 200 的 `Result`）：昵称在 `ScreenName`，
+    /// 手机号在 `NonPlainTextMobile` —— 这两个键名与原实现猜的 `Nickname`/`Phone` 不同。
+    #[test]
+    fn parses_user_info_real_screen_name_shape() {
+        let u = parse_user_info(&json!({"Result": {
+            "AIRegion": "CN",
+            "NonPlainTextEmail": "",
+            "NonPlainTextMobile": "191******52",
+            "Region": "CN",
+            "ScreenName": "用户0044120650",
+            "TenantID": "7o2d894p7dr0o4",
+            "UserID": "3225324630062683"
+        }}));
+        assert_eq!(u.uid, "3225324630062683");
+        assert_eq!(u.nickname.as_deref(), Some("用户0044120650"));
+        assert_eq!(u.phone.as_deref(), Some("191******52"));
     }
 
     #[test]

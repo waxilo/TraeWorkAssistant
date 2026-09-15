@@ -1,6 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { listAccounts, removeAccount, checkinOne, checkinAll } from "../api";
 import type { Account, AcctStatus } from "../types";
+import { mmdd, stamp, daysUntil } from "../format";
 import AddAccountModal from "./AddAccountModal";
 
 /**
@@ -9,6 +10,11 @@ import AddAccountModal from "./AddAccountModal";
  * **数据全部由外层（`App`）持有**：这里只做展示与触发，不做「挂载即拉取」。
  * 原因见 `App.tsx` 顶部说明——页面每次切 tab 都会重新挂载，若把列表状态放在页面内部，
  * 每切一次回来就要重打一遍 `checkin_status`（每个账号两次网络请求），切 tab 会明显发顿。
+ *
+ * ⚠️ **续签没有任何按钮，也永远不会有**（2026-09-15 按用户要求删除）：
+ * token 续签由后端后台线程全自动完成（启动即巡、之后每 30 分钟一轮，见 `renew::spawn`），
+ * 每次签到之前还会顺手续一次。所以这一页只负责**把续签的结果显示出来** ——
+ * 那一列到期时间被推远了，就是它干的活。
  */
 interface Props {
   accounts: Account[];
@@ -24,6 +30,38 @@ interface Props {
 const tokenLabel = (a: Account) =>
   a.token.length > 14 ? `${a.token.slice(0, 6)}…(${a.token.length})` : a.token || "—";
 
+/** 读 JWT 载荷里的 `exp`（秒）。不是 JWT / 解不出来 / 载荷里没有 → `null`。 */
+function jwtExp(token: string): number | null {
+  const seg = token.split(".")[1];
+  if (!seg) return null;
+  try {
+    // base64url → base64（换字符表 + 补 padding），再按 UTF-8 解出 JSON
+    const b64 = seg.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = JSON.parse(atob(b64 + pad)) as { exp?: unknown };
+    return typeof json.exp === "number" ? json.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * token 到期时间（毫秒）。**必须与后端 `renew::expiry_ms` 完全同源**：
+ * 先读 JWT 载荷里的 `exp`（秒），再退回账号上的 `expires_at`
+ * （浏览器登录给毫秒、本机登录态给秒，统一按「小于 1e12 视为秒」归一化）。
+ *
+ * 两边不同源就会出现「界面说还有 20 小时、后台认为已经进窗口」这种错位；
+ * 而这一列现在是「自动续签在不在干活」的**唯一反馈**，所以不容许存在两套算法。
+ */
+function tokenExpiry(a: Account): number | null {
+  const raw = jwtExp(a.token) ?? a.expires_at;
+  if (typeof raw !== "number" || raw <= 0) return null;
+  return raw < 1_000_000_000_000 ? raw * 1000 : raw;
+}
+
+/** 自动续签在「到期前 24 小时」内动手，所以剩余不足 24 小时就算没续上，要提出来。 */
+const RENEW_WINDOW_MS = 24 * 3600 * 1000;
+
 type Credits = {
   /** 剩余可用积分；未知为 null */
   value: number | null;
@@ -33,6 +71,8 @@ type Credits = {
   stale: boolean;
   /** 上次已知值的抓取时刻（仅 `stale` 时有意义） */
   at: string;
+  /** 最早到期时间（毫秒）；未知为 null */
+  expiry: number | null;
 };
 
 /**
@@ -47,7 +87,13 @@ type Credits = {
 function creditsOf(a: Account, statuses: Record<string, AcctStatus>): Credits {
   const live = statuses[a.id];
   if (live && (typeof live.credits === "number" || live.unlimited)) {
-    return { value: live.credits ?? null, unlimited: !!live.unlimited, stale: false, at: "" };
+    return {
+      value: live.credits ?? null,
+      unlimited: !!live.unlimited,
+      stale: false,
+      at: "",
+      expiry: live.earliest_expiry_ms ?? a.credit_snapshot?.earliest_expiry_ms ?? null,
+    };
   }
   const snap = a.credit_snapshot;
   if (snap && (typeof snap.credits === "number" || snap.unlimited)) {
@@ -56,9 +102,10 @@ function creditsOf(a: Account, statuses: Record<string, AcctStatus>): Credits {
       unlimited: !!snap.unlimited,
       stale: true,
       at: snap.fetched_at || "",
+      expiry: snap.earliest_expiry_ms ?? null,
     };
   }
-  return { value: null, unlimited: false, stale: false, at: "" };
+  return { value: null, unlimited: false, stale: false, at: "", expiry: null };
 }
 
 function AccountsPage({
@@ -168,7 +215,7 @@ function AccountsPage({
             <th>区域</th>
             <th title="该账号在 TraeWork 里的剩余可用积分（额度用量，非签到奖励）">积分</th>
             <th>今日</th>
-            <th>Token</th>
+            <th title="token 全自动续签：到期前 24 小时后台自己动手，界面上没有手动按钮">Token</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -179,6 +226,14 @@ function AccountsPage({
             accounts.map((a) => {
               const st = statuses[a.id];
               const cr = creditsOf(a, statuses);
+              const days = !cr.unlimited && cr.expiry ? daysUntil(cr.expiry) : null;
+              const texp = tokenExpiry(a);
+              // 剩余不足 24 小时 = 自动续签没能续上；**已过期**只能重新登录（红），
+              // 还没过期但已进窗口是黄 —— 两者要能一眼分开
+              const texpExpired = texp !== null && texp <= Date.now();
+              const texpSoon = texp !== null && texp - Date.now() < RENEW_WINDOW_MS;
+              const credCls = days === null ? "" : days < 0 ? " bad" : days <= 3 ? " warn" : "";
+              const texpCls = texpExpired ? " bad" : texpSoon ? " warn" : "";
               const cellTitle = cr.unlimited
                 ? "不限量"
                 : cr.stale
@@ -186,10 +241,26 @@ function AccountsPage({
                 : undefined;
               return (
                 <tr key={a.id}>
-                  <td>{a.name}</td>
+                  {/* 真昵称 + 脱敏手机号。名称来自服务端 `ScreenName`，形如「用户0044120650」——
+                      光看名字认不出是哪个号，手机号才是人认得的标识，所以直接显示而不是藏进 title。 */}
+                  <td>
+                    <div className="acct">
+                      <span>{a.name}</span>
+                      {a.phone && <span className="acct-phone">{a.phone}</span>}
+                    </div>
+                  </td>
                   <td>{a.region || "—"}</td>
                   <td title={cellTitle}>
                     {cr.unlimited ? "不限" : cr.value ?? "—"}
+                    {/* 到期时间就是「智能接管先扣谁」的第一排序键，所以直接显示、不埋进 title */}
+                    {!cr.unlimited && cr.expiry && (
+                      <span
+                        className={`sub${credCls}`}
+                        title="智能接管优先使用到期最早的积分"
+                      >
+                        {days !== null && days < 0 ? "已过期" : `${mmdd(cr.expiry)} 到期`}
+                      </span>
+                    )}
                   </td>
                   <td>
                     {st ? (
@@ -198,7 +269,33 @@ function AccountsPage({
                       <span className="muted">—</span>
                     )}
                   </td>
-                  <td className="muted">{tokenLabel(a)}</td>
+                  <td className="muted">
+                    {tokenLabel(a)}
+                    {/* 自动续签的可见证据：到期时间被推远了就是续上了。
+                        没有按钮之后，这一列就是唯一的反馈 —— 所以「未知」必须显式说出来，
+                        否则会有一个「永远不续、界面上又看不出来」的沉默账号。 */}
+                    {texp !== null ? (
+                      <span
+                        className={`sub${texpCls}`}
+                        title={
+                          texpExpired
+                            ? "token 已过期且自动续签没成功，需要重新登录这个账号"
+                            : texpSoon
+                            ? "已进入续签窗口，后台会在 30 分钟内续一轮"
+                            : "自动续签会持续推远这个时间"
+                        }
+                      >
+                        {texpExpired ? "已过期" : `${stamp(texp)} 到期`}
+                      </span>
+                    ) : (
+                      <span
+                        className="sub warn"
+                        title="这个 token 不是 JWT、账号上也没有到期时间 —— 后台无从判断何时该续签，只能跳过它（总不能每 30 分钟盲换一次票）。重新登录一次即可恢复自动续签。"
+                      >
+                        到期未知
+                      </span>
+                    )}
+                  </td>
                   <td>
                     <div className="row" style={{ gap: 6 }}>
                       <button onClick={() => doCheckinOne(a.id)} disabled={busy === a.id}>
@@ -213,11 +310,6 @@ function AccountsPage({
           )}
         </tbody>
       </table>
-
-      <p className="muted" style={{ marginTop: 10 }}>
-        「积分」是该账号在 TraeWork 里的<b>剩余可用积分</b>，点「刷新状态」重新拉取；取不到时显示上次已知值。
-        「智能接管」的选号依据也是它（<b>到期最早优先，其次积分多者</b>）。
-      </p>
 
       {showAdd && (
         <AddAccountModal

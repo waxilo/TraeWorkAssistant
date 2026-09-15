@@ -6,7 +6,7 @@ import {
   oauthPoll,
   openExternal,
 } from "../api";
-import type { Account } from "../types";
+import type { Account, NewAccount } from "../types";
 
 type Tab = "scan" | "browser";
 
@@ -60,8 +60,11 @@ export default function AddAccountModal({ onClose, onImported, notify, setStatus
             setStatus("登录失败: " + (p.error || "未获取到 token"));
             break;
           }
-          const acct: Account = {
-            id: "",
+          // `id` / `created_at` 由后端补：前端编不出唯一 id，硬写空串会让
+          // checkinOne/removeAccount/statuses 的按 id 匹配串号（见 types.ts）。
+          // `name` 来自服务端 `ScreenName`（`GetUserInfo`），拿不到时才落占位名 ——
+          // 后端 `profile.rs` 会在下次启动时按需回源把它换成真名。
+          const acct: NewAccount = {
             name: p.nickname || p.phone || "浏览器登录账号",
             phone: p.phone ?? null,
             region: p.region ?? null,
@@ -73,7 +76,6 @@ export default function AddAccountModal({ onClose, onImported, notify, setStatus
             refresh_expires_at: null,
             device_id: p.device_id ?? null,
             machine_id: p.machine_id ?? null,
-            created_at: new Date().toISOString(),
           };
           const list = await importAccounts([acct]);
           onImported(list);

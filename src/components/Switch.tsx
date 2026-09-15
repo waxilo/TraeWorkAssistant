@@ -6,8 +6,8 @@ interface Props {
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
-  /** sm = 表格/紧凑场景 */
-  size?: "sm" | "md";
+  /** sm = 表格/紧凑场景；lg = 页面主控件（整页只有一个开关时用） */
+  size?: "sm" | "md" | "lg";
   title?: string;
 }
 

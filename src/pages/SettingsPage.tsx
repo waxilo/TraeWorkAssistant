@@ -1,7 +1,7 @@
 import { memo, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import type { Settings } from "../types";
-import { checkAndInstall, type UpdateProgress } from "../updater";
+import { checkAndInstall, percentOf, mb, type UpdateProgress } from "../updater";
 import Switch from "../components/Switch";
 
 interface Props {
@@ -29,6 +29,9 @@ function SettingsPage({ settings, update, notify }: Props) {
     });
     setBusy(false);
   };
+
+  /** 下载百分比；总量未知（服务端没给 Content-Length）时为 null → 走不确定态动画 */
+  const pct = percentOf(progress);
 
   return (
     <>
@@ -65,19 +68,16 @@ function SettingsPage({ settings, update, notify }: Props) {
             />
           </label>
         </div>
-        <p className="muted">
-          应用常驻系统托盘；到达设定时刻自动触发全账号签到（可用上方开关停用）。
-          关闭主窗口即隐藏到托盘。
-        </p>
       </section>
 
       <section className="card">
         <h2>关于与更新</h2>
-        <div className="form" style={{ maxWidth: 420 }}>
+        <div className="form" style={{ maxWidth: 460 }}>
           <div className="muted" style={{ margin: 0 }}>
             当前版本：v{version || "?"}
           </div>
-          <div style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+
+          <div className="row">
             <button onClick={onUpdate} disabled={busy}>
               {busy ? "处理中…" : "检查更新"}
             </button>
@@ -87,6 +87,23 @@ function SettingsPage({ settings, update, notify }: Props) {
               </span>
             )}
           </div>
+
+          {/* 下载/安装进度条：总量已知给百分比，未知则走不确定态动画 */}
+          {(progress?.status === "downloading" || progress?.status === "installing") && (
+            <div className="progress">
+              <div className={`progress-track${pct === null ? " indet" : ""}`}>
+                <div
+                  className="progress-fill"
+                  style={pct === null ? undefined : { width: `${pct}%` }}
+                />
+              </div>
+              <div className="progress-meta">
+                {pct === null
+                  ? `已下载 ${mb(progress.downloaded ?? 0)} MB`
+                  : `${pct}% · ${mb(progress.downloaded ?? 0)} / ${mb(progress.total ?? 0)} MB`}
+              </div>
+            </div>
+          )}
         </div>
         <p className="muted">
           更新从 GitHub Release 拉取已签名的新版本并自动安装、重启。

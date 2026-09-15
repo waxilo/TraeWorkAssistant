@@ -1,6 +1,9 @@
 //! 定时签到线程：按设置里的时刻（HH:MM）每天触发一次全账号签到。
 //! 只在应用运行期间生效（与进程同生命周期）。
 //!
+//! 顺带兼顾一件小事：**端点自愈** —— TraeWork 升级会整份替换 `product.json`，
+//! 智能接管的端点改写会随之丢失，这里每 5 分钟确认一次并补写（见 `endpoint::repair`）。
+//!
 //! ## 为什么要「多轮补签」
 //!
 //! TraeWork 的领取接口（`/trae/api/v2/ug/checkin_credits/claim`）会返回
@@ -19,10 +22,16 @@ use std::time::Duration;
 const MAX_ROUNDS: usize = 3;
 /// 轮与轮之间的间隔。
 const ROUND_GAP_SECS: u64 = 600;
+/// 端点自愈的常规检查间隔：TraeWork 升级会整份替换 `product.json`，改写随之丢失。
+const REPAIR_OK_GAP_SECS: u64 = 300;
+/// 还没就绪时的重试间隔（反代可能刚起来、文件刚被覆盖）——短一点，尽快自愈。
+const REPAIR_RETRY_GAP_SECS: u64 = 20;
 
 pub fn spawn(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last_day: Option<chrono::NaiveDate> = None;
+        // 启动即检查一次端点改写是否还在
+        let mut next_repair = std::time::Instant::now();
         loop {
             let dir = match commands::try_data_dir(&app) {
                 Ok(d) => d,
@@ -33,6 +42,50 @@ pub fn spawn(app: tauri::AppHandle) {
             };
             let settings = accounts::load_settings(&dir);
             let now = chrono::Local::now();
+            if settings.takeover_enabled && std::time::Instant::now() >= next_repair {
+                // ⚠️ 端点必须与 `commands::enable_endpoint` 用**同一个**来源
+                // （`endpoint::base_url`）。端点只有一种形态了，所以这里不再随模式二选一 ——
+                // 但「两端共用同一个函数」这条纪律要保住：曾经这里写死过一个值，与安装侧
+                // 不一致，于是自愈每 20s 都被 `endpoint::preflight` 以「会让 TraeWork
+                // 启动即崩」为由拒绝，journal 里刷屏 `install_blocked`，而 TraeWork 升级
+                // 覆盖 `product.json` 后**再也不会有改道**（接管静默失效）。
+                let endpoint_base = crate::endpoint::base_url(settings.takeover_port);
+
+                // **持续前提**：TraeWork 的 `out/main.js` 必须是打过补丁的。
+                // 升级会把它整份换掉、补丁随之消失，而端点还写着明文 `http://` ——
+                // **它下一次启动就会崩**。所以每轮都确认一遍，丢了就补回来。
+                let gate_ok = match crate::patch::apply(&dir) {
+                    Ok(p) => p.patched,
+                    Err(e) => {
+                        crate::journal::append_dedup(
+                            &dir,
+                            "patch_gone",
+                            &format!(
+                                "免证书模式：闸门补丁无法保证（{e}）。\
+                                 已放弃端点改写并恢复官方直连 —— 否则 TraeWork 下次启动会因明文端点崩掉"
+                            ),
+                        );
+                        false
+                    }
+                };
+
+                let ready = if gate_ok {
+                    // 反代没监听时绝不改写端点，否则会把 TraeWork 指向死端口
+                    crate::proxy::status().active && crate::endpoint::repair(&dir, &endpoint_base)
+                } else {
+                    // fail-safe：补丁没保证就**绝不**把明文端点留在 product.json 里。
+                    // `uninstall` 幂等，不是我们改的就不动。
+                    let dir2 = dir.clone();
+                    let _ = crate::endpoint::uninstall(&dir2);
+                    false
+                };
+                next_repair = std::time::Instant::now()
+                    + Duration::from_secs(if ready {
+                        REPAIR_OK_GAP_SECS
+                    } else {
+                        REPAIR_RETRY_GAP_SECS
+                    });
+            }
             if settings.checkin_enabled {
                 let today = now.date_naive();
                 if last_day != Some(today) {
@@ -82,7 +135,7 @@ fn run_checkin(app: &tauri::AppHandle, dir: &std::path::Path) {
         for mut account in pending {
             let name = account.name.clone();
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let _ = tauri::async_runtime::block_on(crate::refresh::refresh_account(dir, &mut account));
+            let _ = tauri::async_runtime::block_on(crate::renew::renew_if_needed(dir, &mut account));
             let r = tauri::async_runtime::block_on(crate::checkin::do_checkin(&account));
             logs::push(
                 &name,

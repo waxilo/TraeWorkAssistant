@@ -3,15 +3,22 @@
 mod accounts;
 mod checkin;
 mod commands;
+mod devicekey;
 mod endpoint;
 mod journal;
 mod logs;
 mod notify;
 mod oauth;
+mod patch;
+mod portcheck;
+mod profile;
 mod proxy;
-mod refresh;
+mod renew;
+mod rules;
 mod scheduler;
+mod token;
 mod trae_auth;
+mod traework;
 mod tray;
 
 use tauri_plugin_autostart::MacosLauncher;
@@ -32,6 +39,17 @@ pub fn run() {
     }
 
     let app = tauri::Builder::default()
+        // **必须第一个注册**：单实例守卫生效时，后起的实例会在此直接退出，
+        // 根本走不到 `setup()`，也就不会去抢反代端口、不会碰 TraeWork。
+        //
+        // 为什么非有不可：两个实例共享同一份 `settings.json` 和同一个反代端口。
+        // 用户在 A 里打开接管 → 写入共享的 `takeover_enabled` → B 轮询到后也去绑同一端口
+        // → 只有一个能绑上，抢输的按设计「回滚整个共享开关」→ 赢的看到开关变 false 又释放端口。
+        // 净效果是接管永远稳不住，而报错只有一句毫无出路的 `Address already in use`。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 第二次点击图标 = 「把已有窗口拿到前面来」，而不是再开一份
+            tray::show_main(app);
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -40,8 +58,14 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            // 定时签到 + 智能接管反代：独立后台线程，与进程同生命周期
+            // 设备身份（密钥对 + 设备号）要落盘，续签才能成立 —— 见 `devicekey` 顶部说明
+            if let Ok(dir) = commands::try_data_dir(app.handle()) {
+                oauth::set_data_dir(dir);
+            }
+            // 定时签到 + 自动续签（**无手动入口**：续签全自动，界面上没有按钮）
+            // + 智能接管反代：独立后台线程，与进程同生命周期
             scheduler::spawn(app.handle().clone());
+            renew::spawn(app.handle().clone());
             proxy::spawn_proxy(app.handle().clone());
             // 启动清扫：等反代有机会绑定端口后，判断是否需要恢复 TraeWork 端点配置。
             // 只保留「接管开启且反代确实在监听」这一种情形，其余一律恢复官方直连。
@@ -58,8 +82,21 @@ pub fn run() {
                                 std::thread::sleep(std::time::Duration::from_millis(100));
                             }
                         }
+                        // 端点改写的唯一保留条件：**接管开着 且 反代确实在监听**。
+                        // 其余一律恢复官方直连 —— 端点指向一个没人接的端口，是整应用不可用。
                         let keep = s.takeover_enabled && proxy::status().active;
                         let _ = endpoint::sweep(&d, keep);
+                        // ⚠️ 反向清扫**不能因为「经系统代理接管」已被移除就删掉**。
+                        // 那条路在**用户机器上**留的痕迹不会自己消失：老版本可能把 TraeWork 的
+                        // `User/settings.json` 指到了本机回环代理，而新版的反代不再做正向代理
+                        // （明文 CONNECT 一律 405），那个设置留着 = TraeWork 整应用不可用。
+                        // 所以每次启动都确认一遍：只要它还指着本机回环，就清掉。
+                        // `uninstall` 按**回环指纹**判定，绝不碰用户自己配的非回环代理。
+                        if traework::applied(s.takeover_port) {
+                            if let Ok(msg) = traework::uninstall(&d) {
+                                let _ = journal::append(&d, "legacy_proxy_clear", &msg);
+                            }
+                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -79,6 +116,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_accounts,
+            commands::refresh_account_profiles,
             commands::import_accounts,
             commands::remove_account,
             commands::discover_local,
@@ -95,6 +133,8 @@ pub fn run() {
             commands::takeover_status,
             commands::takeover_enable,
             commands::takeover_disable,
+            commands::takeover_rules,
+            commands::takeover_save_rules,
             commands::takeover_events,
             commands::clear_takeover_events,
         ])

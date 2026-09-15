@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { getSettings, saveSettings, listAccounts, checkinStatus } from "./api";
+import { getSettings, saveSettings, listAccounts, checkinStatus, refreshAccountProfiles } from "./api";
 import type { AcctStatus, Account, Page, Settings } from "./types";
 import AccountsPage from "./pages/AccountsPage";
 import TakeoverPage from "./pages/TakeoverPage";
@@ -74,6 +74,11 @@ export default function App() {
     getSettings().then(setSettings).catch(() => {});
     getVersion().then(setVersion).catch(() => {});
     listAccounts().then(setAccounts).catch(() => {});
+    // 账号资料补全：真昵称（GetUserInfo.ScreenName）与脱敏手机号（NonPlainTextMobile）都只能
+    // 从服务端查，所以启动后按需回源一次 —— 把「浏览器登录账号」/手机号当名字这类占位值换成
+    // 真名，并给缺手机号的账号补上。不阻塞首屏：先渲染本地列表，拿到结果再覆盖
+    // （后端只对资料不全的账号发请求，离线时静默返回原列表）。
+    refreshAccountProfiles().then(setAccounts).catch(() => {});
     void refreshStatus();
   }, [refreshStatus]);
 
@@ -137,7 +142,12 @@ export default function App() {
             />
           )}
           {page === "takeover" && (
-            <TakeoverPage settings={settings} update={update} notify={notify} />
+            <TakeoverPage
+              settings={settings}
+              update={update}
+              notify={notify}
+              accounts={accounts}
+            />
           )}
           {page === "logs" && <LogsPage />}
           {page === "settings" && (

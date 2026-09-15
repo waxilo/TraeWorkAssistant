@@ -242,6 +242,43 @@ pub fn discover_local_accounts() -> Vec<TraeLocalAccount> {
     out
 }
 
+/// 本机 TraeWork 的**真实设备标识** `(devDeviceId, machineId)`（`storage.json` 顶层的
+/// `telemetry.devDeviceId` / `telemetry.machineId`）。
+///
+/// 语义与官方客户端一致：**一台机器一个设备号**，与当前登录的是哪个账号无关
+/// （官方 `fb()` 里就是 `x-device-id = guaranteedDeviceId`）。
+///
+/// 用途：给「本机没有登录态的账号」（如浏览器登录新签发的号）提供可信的 `x-device-id`。
+/// 浏览器登录流程落库的 `device_id` 是**授权时随机生成的 uuid**，服务端从未登记过它，
+/// `checkin_credits/claim` 会持续回 9074 —— 见 [`crate::checkin::device_id`]。
+pub fn local_device_identity() -> (Option<String>, Option<String>) {
+    for dir in storage_paths() {
+        let Some(text) = std::fs::read_to_string(dir.join("storage.json")).ok() else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let device = str_at(&json, "telemetry.devDeviceId");
+        let machine = str_at(&json, "telemetry.machineId");
+        if device.is_some() || machine.is_some() {
+            return (device, machine);
+        }
+    }
+    (None, None)
+}
+
+/// 本机 TraeWork 登录态里是否有这个 uid 的登录态。
+///
+/// 用途：**续签的第二条路**（[`crate::renew`]）—— TraeWork 自己会拿 refresh token 续签并把
+/// 新 token 写回 `storage.json`，所以对「同时登录在本机 TraeWork 里」的账号，
+/// 我们只要在它更新后同步过来即可，不需要任何密钥。
+pub fn find_local_session_by_uid(uid: &str) -> Option<TraeLocalAccount> {
+    discover_local_accounts()
+        .into_iter()
+        .find(|a| a.user_id.as_deref() == Some(uid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
