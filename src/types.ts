@@ -46,12 +46,20 @@ export interface Settings {
   /**
    * 智能接管：端点改写（`product.json` 指向本机明文反代）+ 免证书（不装 CA、不讲 TLS）一体开关。
    *
-   * ⚠️ 免证书是**唯一**形态：端点恒为 `http://127.0.0.1:PORT`，前提是 TraeWork 已打过
+   * ⚠️ 免证书是**唯一**形态：端点恒为 `http://127.0.0.1:PORT`，前提是目标应用已打过
    * 「免证书补丁」；未打补丁时写明文端点会让它启动即崩。
    */
   takeover_enabled: boolean;
   /** 本地反代监听端口 */
   takeover_port: number;
+  /**
+   * 接管哪些应用（按应用 id，即 `.app` 名，如 `TRAE SOLO CN` / `Trae CN`）。
+   *
+   * ⚠️ **空列表 = 全部**（与 `billing_account_ids` 同一套语义，也是「从没配置过」的默认态）
+   * —— 所以界面上把空列表渲染成「全部勾选」，且「全不选」被禁止（那会写回空列表、退回全部）。
+   * 本机已经不存在的 id 会被后端丢掉，不会留在设置里。
+   */
+  takeover_apps: string[];
   billing_account_ids: string[];
   webhook_url: string;
 }
@@ -150,14 +158,15 @@ export interface TakeoverRules {
 }
 
 /**
- * TraeWork 主进程「闸门补丁」状态。
+ * 某个应用的主进程「闸门补丁」状态。
  *
- * 补丁把 TraeWork 的 URL pattern 闸门从「只认 https」改成「认任何 scheme」，
+ * 补丁把它的 URL pattern 闸门从「只认 https」改成「认任何 scheme」，
  * 于是本地端点可以走**明文回环** —— 免证书模式的唯一前置条件。
- * ⚠️ 本机是否打得成由 `writable` 决定：macOS「App 管理」(TCC) 会拦住对已签名应用包的修改。
+ * ⚠️ 打得成与否由 `writable` 决定：macOS「App 管理」(TCC) 会拦住对已签名应用包的修改。
+ * ⚠️ 现在**每个应用各有一份**（本机可能装了多个 Trae shell），互不影响。
  */
 export interface PatchStatus {
-  /** 找到 TraeWork 的 `out/main.js` 了吗（false = 本机不支持免证书模式） */
+  /** 找到该应用的 `out/main.js` 了吗（false = 这个应用不支持免证书模式） */
   supported: boolean;
   /** 被改的目标文件 */
   target?: string | null;
@@ -165,7 +174,7 @@ export interface PatchStatus {
   writable: boolean;
   /** 当前是否已打过补丁 */
   patched: boolean;
-  /** 版本是否被识别（`false` 时助手**拒绝**打补丁 —— 宁可不禁用证书，也不能把 TraeWork 弄坏） */
+  /** 版本是否被识别（`false` 时助手**拒绝**打补丁 —— 宁可不禁用证书，也不能把应用弄坏） */
   recognized: boolean;
   /** 扫到的闸门处数（诊断用，正常是 2） */
   gates: number;
@@ -175,7 +184,42 @@ export interface PatchStatus {
   message: string;
 }
 
-/** 智能接管状态（本地反代 + TraeWork 改道）。 */
+/**
+ * 本机发现到的**一个** Trae 应用（含未被勾选的）。
+ *
+ * `id` = `.app` 名（macOS）/ 安装目录名（Windows），同时是设置里的选择键、界面标签与
+ * 进程控制句柄 —— 三者同源，不给它加一层会漂的映射。
+ */
+export interface AppStatus {
+  /** 稳定 id（macOS 下 = `.app` 名），也是设置里记录选择用的键 */
+  id: string;
+  /** 显示名（当前与 id 相同） */
+  label: string;
+  /** 应用包（macOS）/ 安装目录（Windows）—— 排障时要能一眼看到在改谁 */
+  bundle: string;
+  app_dir: string;
+  /** 是否在接管名单里（名单为空 = 全部 ⇒ 这里恒 `true`） */
+  selected: boolean;
+  /** 当前是否在运行 */
+  running: boolean;
+  /** `product.json` 的端点是否已指向本机反代 */
+  installed: boolean;
+  /** 上述改写是不是本助手写的（只有带标记才敢还原） */
+  ours: boolean;
+  /** 它的安装目录是否**真能写** —— 不能写就没有任何一步能成 */
+  writable: boolean;
+  /** 它自己的闸门补丁状态 */
+  patch: PatchStatus;
+  upstream_http: string | null;
+  upstream_ws: string | null;
+  /**
+   * **只在有事要说时非空**（版本不认识 / 不可写 / 被别人改过 / 端点丢了）。
+   * 一切正常时是空串 —— 界面上一行文字都不该出现。
+   */
+  message: string;
+}
+
+/** 智能接管状态（本地反代 + 应用改道）。 */
 export interface TakeoverStatus {
   /** 用户是否已开启接管 */
   enabled: boolean;
@@ -184,25 +228,16 @@ export interface TakeoverStatus {
   /** 本地反代是否正在监听 */
   proxy_active: boolean;
   proxy_error: string | null;
-  /** TraeWork 当前是否在运行 */
-  trae_running: boolean;
-  /** 是否找到 TraeWork 安装目录（false = 本机不支持接管） */
-  supported: boolean;
-  app_dir: string | null;
-  /** 端点模式：`product.json` 里的端点是否已指向本机反代 */
-  installed: boolean;
-  /** 上述改写是否由本助手写入（只有带标记才敢还原） */
-  ours: boolean;
-  /** 安装目录是否**真能写**（macOS「App 管理」TCC / 只读卷靠真写才发现）—— 只有端点模式在乎 */
-  writable: boolean;
   /** 本机反代端点基址（恒为明文 `http://127.0.0.1:PORT`，只作展示） */
   endpoint_base: string;
   /** 当前生效的接管规则 */
   rules: TakeoverRules;
-  /** TraeWork 主进程补丁状态（免证书模式的唯一前置条件） */
-  patch: PatchStatus;
-  upstream_http: string | null;
-  upstream_ws: string | null;
+  /** 端点覆盖租约是否新鲜（反代的心跳） */
   lease_fresh: boolean;
+  /** 本机发现到的**全部** Trae 应用（含未勾选的）—— 界面据此渲染「接管应用」多选 */
+  apps: AppStatus[];
+  /** 接管名单里、但本机已经不存在的 id（应用卸载了 / 改名了） */
+  missing_apps: string[];
+  /** 总状态那句话（成功时也可以是陈述句；界面只在有东西挡路时才显示） */
   message: string;
 }

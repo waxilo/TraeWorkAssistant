@@ -167,6 +167,16 @@ pub struct Settings {
     pub takeover_enabled: bool,
     /// 本机反代监听端口
     pub takeover_port: u16,
+    /// **接管哪些应用**：值是 `target::AppTarget::id`（macOS 下 = `.app` 的名字，
+    /// 如 `TRAE SOLO CN` / `Trae CN`）。
+    ///
+    /// ## 空 = 全部（与「参与扣费的账号」同一套语义）
+    ///
+    /// 本机可能同时装着几个 Trae shell，默认全接管；用户想只接管其中一个时，这里才写入
+    /// 显式名单。这样「没配置过」与「全选」是同一个状态（和 `billing_account_ids` 一致），
+    /// 也不会出现「设置里存着一份与本机不符的名单」——名单里不存在的 id 由
+    /// `target::missing()` 负责报出来，而不是让它悄悄失效。
+    pub takeover_apps: Vec<String>,
     /// 参与接管的账号白名单（空 = 全部）
     pub billing_account_ids: Vec<String>,
     /// 告警 webhook（可选）
@@ -180,6 +190,7 @@ impl Default for Settings {
             checkin_time: "10:00".into(),
             takeover_enabled: false,
             takeover_port: 8788,
+            takeover_apps: Vec::new(),
             billing_account_ids: Vec::new(),
             webhook_url: String::new(),
         }

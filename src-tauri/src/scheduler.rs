@@ -50,35 +50,56 @@ pub fn spawn(app: tauri::AppHandle) {
                 // 启动即崩」为由拒绝，journal 里刷屏 `install_blocked`，而 TraeWork 升级
                 // 覆盖 `product.json` 后**再也不会有改道**（接管静默失效）。
                 let endpoint_base = crate::endpoint::base_url(settings.takeover_port);
+                let all = crate::target::discover();
+                let selected = crate::target::select(&settings.takeover_apps);
+                let proxy_ok = crate::proxy::status().active;
 
-                // **持续前提**：TraeWork 的 `out/main.js` 必须是打过补丁的。
-                // 升级会把它整份换掉、补丁随之消失，而端点还写着明文 `http://` ——
-                // **它下一次启动就会崩**。所以每轮都确认一遍，丢了就补回来。
-                let gate_ok = match crate::patch::apply(&dir) {
-                    Ok(p) => p.patched,
-                    Err(e) => {
-                        crate::journal::append_dedup(
-                            &dir,
-                            "patch_gone",
-                            &format!(
-                                "免证书模式：闸门补丁无法保证（{e}）。\
-                                 已放弃端点改写并恢复官方直连 —— 否则 TraeWork 下次启动会因明文端点崩掉"
-                            ),
-                        );
+                // ① 名单之外的应用整个放下（端点 + 补丁）。这条同时兜住两件事：
+                //    用户在界面里取消勾选（那条路会立即处理，这里是幂等的第二道）、
+                //    以及有人直接手改了 `settings.json`。
+                crate::endpoint::sweep(&dir, &all, &selected);
+
+                // ② 反代不在监听时，指向本机的端点**必须先还回官方**（补丁不动）。
+                //    两条生命周期的分工见 `endpoint::restore_endpoints` 的文档 ——
+                //    简单说：补丁跟着「名单」走、端点跟着「连得上」走，否则会有还补丁/重打补丁的抖动。
+                if !proxy_ok {
+                    crate::endpoint::restore_endpoints(&dir, &all);
+                }
+
+                // ③ 名单里的每个应用：补丁必须在位，端点必须指向本机。
+                let mut ready = !selected.is_empty();
+                for t in &selected {
+                    // **持续前提**：该应用的 `out/main.js` 必须是打过补丁的。
+                    // 升级会把它整份换掉、补丁随之消失，而端点还写着明文 `http://` ——
+                    // **它下一次启动就会崩**。所以每轮都确认一遍，丢了就补回来。
+                    let gate_ok = match crate::patch::apply(&dir, t) {
+                        Ok(p) => p.patched,
+                        Err(e) => {
+                            crate::journal::append_dedup(
+                                &dir,
+                                "patch_gone",
+                                &format!(
+                                    "免证书模式：「{}」的闸门补丁无法保证（{e}）。\
+                                     已放弃对它做端点改写并恢复官方直连 —— \
+                                     否则它下次启动会因明文端点崩掉",
+                                    t.id
+                                ),
+                            );
+                            false
+                        }
+                    };
+
+                    let ok = if gate_ok {
+                        // 反代没监听时绝不改写端点，否则会把应用指向死端口
+                        proxy_ok && crate::endpoint::repair(t, &dir, &endpoint_base)
+                    } else {
+                        // fail-safe：补丁没保证就**绝不**把明文端点留在它的 product.json 里。
+                        // `uninstall` 幂等，不是我们改的就不动。
+                        let _ = crate::endpoint::uninstall(t, &dir);
                         false
-                    }
-                };
-
-                let ready = if gate_ok {
-                    // 反代没监听时绝不改写端点，否则会把 TraeWork 指向死端口
-                    crate::proxy::status().active && crate::endpoint::repair(&dir, &endpoint_base)
-                } else {
-                    // fail-safe：补丁没保证就**绝不**把明文端点留在 product.json 里。
-                    // `uninstall` 幂等，不是我们改的就不动。
-                    let dir2 = dir.clone();
-                    let _ = crate::endpoint::uninstall(&dir2);
-                    false
-                };
+                    };
+                    ready &= ok;
+                }
                 next_repair = std::time::Instant::now()
                     + Duration::from_secs(if ready {
                         REPAIR_OK_GAP_SECS

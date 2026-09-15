@@ -91,6 +91,16 @@
 //! 它同时（有意）保留对 `https://` 的放行：那不只是历史兼容，TraeWork 自己的闸门规则
 //! 就在这里被复刻，`https` 分支是**验证这份复刻是否忠实**的对照组。
 //!
+//! ## 一个应用一份改写 —— 本模块一律**显式带目标**
+//!
+//! 本机可能同时装着几个 Trae shell（`TRAE SOLO CN.app` + `Trae CN.app`，同一份主进程代码
+//! 打包出的两个入口）。所以这个模块里**没有**「本机的那个 TraeWork」这种概念：
+//! 每个函数都收一个 [`AppTarget`]（由 [`crate::target`] 发现并给出稳定 id），
+//! 端点改写、备份文件、还原标记全部落在**那个应用自己的安装目录**里，互不干扰。
+//!
+//! 唯一还叫「默认目标」的东西是 [`app_dir`] —— 它只服务于与接管无关的读用途
+//! （`x-app-version` 这类「这个应用是什么版本」的问题），接管逻辑本身不再经过它。
+//!
 //! ## 安全设计（必须遵守，否则会让 TraeWork 全量失败）
 //!
 //! 改写 `product.json` 是把「指向死端口」的风险直接压到了 TraeWork 的启动路径上，所以：
@@ -102,16 +112,15 @@
 //! 4. **人工兜底**：首次改写前把整份 `product.json` 备份为 `product.json.twa-orig`
 //!    （已存在则不覆盖），万一程序还原失效也能手动恢复；
 //! 5. **绝不碰别人的改动**：没有标记就不认为是我们改的，`uninstall` 直接返回 `Ok(false)`；
-//! 6. 启动 `sweep()`：只有确认本地反代不可用时才还原（见函数文档）；
+//! 6. 启动 `sweep()`：把**不在保留名单里**的目标统统还原（见函数文档）；
 //! 7. `repair()`：TraeWork 升级会把 `product.json` 换掉、我们的改动随之丢失，
 //!    定期检查并补写（写回后需要重启 TraeWork 才生效）。
 
+use crate::target::AppTarget;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
-/// TraeWork 的产品配置文件（与 `product.json` 同目录）。
-const PRODUCT_FILE: &str = "product.json";
 /// 自识别标记键（`product.json` 顶层）。
 const MARKER_KEY: &str = "__traeWorkAssistant";
 /// 首次改写前的整份备份（人工兜底用，程序**不**读它）。
@@ -309,66 +318,13 @@ pub fn first_bad_pattern(doc: &Value) -> Option<(String, String)> {
     first_bad_pattern_mode(doc, false)
 }
 
-/// 候选 TraeWork 应用显示名（Windows 安装目录名 / macOS bundle 名）。
-fn app_names() -> &'static [&'static str] {
-    &["TRAE SOLO CN", "TRAE", "Trae TRAE", "TRAE CN", "Trae CN"]
-}
-
-/// TraeWork 的 `resources/app` 目录（内含 `product.json`）。
+/// 「默认目标」的 `Resources/app`。
+///
+/// ⚠️ **只给与接管无关的读用途**（`crate::checkin::app_version` 那种「这个应用是什么版本」
+/// 的问题）。接管逻辑一律显式带 [`AppTarget`] —— 这个函数存在只是因为 `x-app-version`
+/// 需要一个值，而不是因为「本机只有一个 TraeWork」。
 pub fn app_dir() -> Option<PathBuf> {
-    let mut cands: Vec<PathBuf> = Vec::new();
-    #[cfg(target_os = "windows")]
-    {
-        let bases: Vec<PathBuf> = [dirs::data_local_dir(), dirs::data_dir()]
-            .into_iter()
-            .flatten()
-            .collect();
-        for base in &bases {
-            for app in app_names() {
-                // 用户级安装（默认）：%LOCALAPPDATA%\Programs\<app>\resources\app
-                cands.push(base.join("Programs").join(app).join("resources").join("app"));
-                // 少数安装器直接落在 %LOCALAPPDATA%\<app>
-                cands.push(base.join(app).join("resources").join("app"));
-            }
-        }
-        // 机器级安装
-        for key in ["ProgramFiles", "ProgramFiles(x86)"] {
-            if let Some(pf) = std::env::var_os(key) {
-                for app in app_names() {
-                    cands.push(PathBuf::from(&pf).join(app).join("resources").join("app"));
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for app in app_names() {
-            cands.push(
-                PathBuf::from("/Applications")
-                    .join(format!("{app}.app"))
-                    .join("Contents")
-                    .join("Resources")
-                    .join("app"),
-            );
-        }
-        if let Some(home) = dirs::home_dir() {
-            for app in app_names() {
-                cands.push(
-                    home.join("Applications")
-                        .join(format!("{app}.app"))
-                        .join("Contents")
-                        .join("Resources")
-                        .join("app"),
-                );
-            }
-        }
-    }
-    cands.into_iter().find(|p| p.join(PRODUCT_FILE).exists())
-}
-
-/// `product.json` 的路径。
-pub fn product_path() -> Option<PathBuf> {
-    app_dir().map(|d| d.join(PRODUCT_FILE))
+    crate::target::default_target().map(|t| t.app_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +448,10 @@ fn pick_domain(node: &Value, prefix: &str) -> Option<String> {
     first_prefixed(node, prefix)
 }
 
-/// 原始上游地址 `(http, ws)`。
+/// 原始上游地址 `(http, ws)` —— 跨**全部**已发现的目标各取第一条能确定的。
+///
+/// 反代只有一份、上游域名只有一个，所以这里不需要「属于哪个应用」的答案；而多取几个目标
+/// 反而更稳：某个应用的 `product.json` 正被升级换掉时，另一个还能把域名说出来。
 ///
 /// **顺序很重要**：`product.json` 被我们改写过之后，这两个键已经是本地地址，
 /// 直接读文件会解析出 `127.0.0.1`，反代就会把请求转给自己（自环）。
@@ -501,9 +460,25 @@ fn pick_domain(node: &Value, prefix: &str) -> Option<String> {
 /// 返回的是**完整地址**（含路径）：`ws` 那条带 `/custom_model` 之类的路径，
 /// 反代要靠它把 WS 连接路由回真正的上游。
 pub fn read_upstreams() -> (Option<String>, Option<String>) {
-    let Some(path) = product_path() else {
-        return (None, None);
-    };
+    let (mut http, mut ws) = (None, None);
+    for target in crate::target::discover() {
+        let (h, w) = upstreams_of(&target);
+        if http.is_none() {
+            http = h;
+        }
+        if ws.is_none() {
+            ws = w;
+        }
+        if http.is_some() && ws.is_some() {
+            break;
+        }
+    }
+    (http, ws)
+}
+
+/// 单个目标的上游地址。
+pub fn upstreams_of(target: &AppTarget) -> (Option<String>, Option<String>) {
+    let path = target.product_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
         return (None, None);
     };
@@ -786,7 +761,7 @@ fn clear_lease(dir: &Path) {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct EndpointStatus {
-    /// 是否找到 TraeWork 安装目录（找不到则本机不支持拦截模式）。
+    /// 是否找到这个目标的安装目录（找不到则本机不支持对它做端点改写）。
     pub supported: bool,
     pub app_dir: Option<String>,
     /// `product.json` 里的端点是否**已指向本机反代**（= 改写仍生效）。
@@ -795,7 +770,7 @@ pub struct EndpointStatus {
     pub ours: bool,
     /// 安装目录是否可写（权限）。
     pub writable: bool,
-    /// 本机网关端点基址（`https://127.0.0.1:PORT`，即改写写入 `remote.trae.normal` 的值）。
+    /// 本机网关端点基址（`http://127.0.0.1:PORT`，即改写写入 `remote.trae.normal` 的值）。
     pub endpoint_base: String,
     /// 原始上游（取自标记记录或 product.json，便于界面展示与排障）。
     pub upstream_http: Option<String>,
@@ -804,36 +779,41 @@ pub struct EndpointStatus {
     pub message: String,
 }
 
-/// 读取当前状态（只读，不修改任何文件）。
-pub fn status(dir: &Path, endpoint_base: &str) -> EndpointStatus {
-    let app = app_dir();
-    let (up_http, up_ws) = read_upstreams();
-    let doc = product_path().and_then(|p| read_product(&p).ok());
+/// 读取某个目标的当前状态（只读，不修改任何文件）。
+pub fn status(target: &AppTarget, dir: &Path, endpoint_base: &str) -> EndpointStatus {
+    let app = target.app_dir.clone();
+    let (up_http, up_ws) = upstreams_of(target);
+    let doc = read_product(&target.product_path()).ok();
     let installed = doc.as_ref().map(|d| doc_points_at(d, endpoint_base)).unwrap_or(false);
     let ours = doc.as_ref().map(doc_is_ours).unwrap_or(false);
-    let writable = app.as_ref().map(|d| writable_probe(d)).unwrap_or(false);
-    let message = if app.is_none() {
-        "未找到 TraeWork 安装目录，本机不支持「智能接管」。".to_string()
+    let writable = writable_probe(&app);
+    let message = if !target.product_path().exists() {
+        format!("在「{}」里没找到 product.json，本机不支持对它做端点改写。", target.id)
     } else if !writable {
         // 「不可写」的成因与处置**只有一份话术**（与 `crate::patch` 共用），这里只补上下文。
         format!(
-            "TraeWork 安装目录不可写，无法改写端点配置。{}",
-            unwritable_hint(app.as_ref().map(|p| p.as_path()).unwrap_or(Path::new("")))
+            "「{}」的安装目录不可写，无法改写端点配置。{}",
+            target.id,
+            unwritable_hint(&app)
         )
     } else if installed && !ours {
-        "TraeWork 的 product.json 已指向本机反代，但没带本助手的标记——助手不会改动也不会还原它。"
-            .to_string()
+        format!(
+            "「{}」的 product.json 已指向本机反代，但没带本助手的标记——助手不会改动也不会还原它。",
+            target.id
+        )
     } else if installed {
-        "接管已生效：TraeWork 的模型/会话请求将经本机反代按账号池转发。".to_string()
+        format!("「{}」端点改写已生效：模型/会话请求将经本机反代按账号池转发。", target.id)
     } else if ours {
-        "product.json 带本助手标记，但端点未指向本机反代（端口或版本变了），重新开启接管可修复。"
-            .to_string()
+        format!(
+            "「{}」带本助手标记，但端点未指向本机反代（端口或版本变了），重新开启接管可修复。",
+            target.id
+        )
     } else {
-        "未接管：TraeWork 仍直连官方。".to_string()
+        format!("「{}」未接管：仍直连官方。", target.id)
     };
     EndpointStatus {
-        supported: app.is_some(),
-        app_dir: app.map(|d| d.display().to_string()),
+        supported: true,
+        app_dir: Some(app.display().to_string()),
         installed,
         ours,
         writable,
@@ -867,35 +847,35 @@ fn blocked_message(raw: &str, pattern: &str) -> String {
 
 /// 判定该用哪一套闸门规则，并把「端点协议 ↔ 补丁状态」这条不变量钉在这里。
 ///
-/// - 端点 `http://`（**现在唯一会写的形态**）→ **必须**已打补丁，否则就地拒绝；
+/// - 端点 `http://`（**现在唯一会写的形态**）→ **必须**这个目标已打补丁，否则就地拒绝；
 /// - 端点 `https://` → 原版闸门即可（已无写入方，保留是当对照组）。
 ///
-/// 返回 `patched`：TraeWork 当前真实的闸门形态（打过补丁的应用两种 scheme 都接受）。
-fn gate_mode_for(endpoint_base: &str) -> Result<bool, String> {
-    let patched = crate::patch::is_patched();
+/// `patched` 是**这个目标**的真实闸门形态：补丁是「一个应用一份」的，所以这个判断也必须
+/// 按目标做 —— 给 SOLO 打过补丁不代表 `Trae CN` 的闸门能接受明文端点。
+/// 返回 `patched`：该目标当前真实的闸门形态（打过补丁的应用两种 scheme 都接受）。
+fn gate_mode_for(target: &AppTarget, endpoint_base: &str) -> Result<bool, String> {
+    let patched = crate::patch::is_patched(target);
     if is_plain(endpoint_base) && !patched {
         return Err(format!(
-            "端点 {endpoint_base} 需要先给 TraeWork 打「免证书补丁」。\n\
+            "端点 {endpoint_base} 需要先给「{}」打「免证书补丁」。\n\
              未打补丁时它的闸门只接受 https://，会把 http://… 拼成 https://http://…/*（非法 port），\
-             让 TraeWork 启动即崩。\n\
-             在接管页点一次「打免证书补丁」即可 —— 补丁可逐字节还原，之后再开接管。"
+             让它启动即崩。\n\
+             开启「智能接管」时会自动完成这一步（补丁逐字节可还原）。",
+            target.id
         ));
     }
     Ok(patched)
 }
 
-/// **只读**预检：在内存里模拟一次改写，跑 TraeWork 的 pattern 规则，一个字节都不写。
+/// **只读**预检：在内存里模拟一次改写，跑那个应用自己的 pattern 规则，一个字节都不写。
 ///
-/// `enable_blocking` 在动任何东西（开关、反代、TraeWork 进程）**之前**先调它——
-/// 不通过就直接报错，避免留下「开关开着 / 反代占着端口 / TraeWork 被关掉」的半开状态。
-pub fn preflight(endpoint_base: &str) -> Result<(), String> {
-    let patched = gate_mode_for(endpoint_base)?;
-    let Some(app) = app_dir() else {
-        return Ok(()); // 不支持改写的机器交给上层分支去解释
-    };
-    let path = app.join(PRODUCT_FILE);
+/// `enable_blocking` 在动任何东西（开关、反代、应用进程）**之前**先对每个目标调它——
+/// 任何一个不通过就直接报错，避免留下「开关开着 / 反代占着端口 / 应用被关掉」的半开状态。
+pub fn preflight(target: &AppTarget, endpoint_base: &str) -> Result<(), String> {
+    let patched = gate_mode_for(target, endpoint_base)?;
+    let path = target.product_path();
     if !path.exists() {
-        return Ok(());
+        return Ok(()); // 目标不完整（升级中途）交给上层分支去解释
     }
     let mut doc = read_product(&path)?;
     patch_doc(&mut doc, endpoint_base);
@@ -905,29 +885,36 @@ pub fn preflight(endpoint_base: &str) -> Result<(), String> {
     }
 }
 
-/// 改写 `product.json`，把 5 个端点指向 `endpoint_base`。
+/// 改写某个目标的 `product.json`，把 5 个端点指向 `endpoint_base`。
 ///
-/// **调用方必须保证反代已在监听 `endpoint_base`**，否则会让 TraeWork 全量失败。
+/// **调用方必须保证反代已在监听 `endpoint_base`**，否则会让这个应用全量失败。
 /// 幂等：已经是我们的文档时只做必要的更新（改端口）。
 ///
-/// **fail-closed**：先在内存里改完并跑 `first_bad_pattern()`（模拟 TraeWork 的
+/// **fail-closed**：先在内存里改完并跑 `first_bad_pattern_mode()`（模拟应用自己的
 /// webRequest pattern 规则），过不了就**一个字节都不写**，直接带原因返回。
-pub fn install(dir: &Path, endpoint_base: &str) -> Result<EndpointStatus, String> {
-    let patched = gate_mode_for(endpoint_base)?;
-    let app = app_dir().ok_or_else(|| "未找到 TraeWork 安装目录".to_string())?;
-    let path = app.join(PRODUCT_FILE);
+pub fn install(
+    target: &AppTarget,
+    dir: &Path,
+    endpoint_base: &str,
+) -> Result<EndpointStatus, String> {
+    let patched = gate_mode_for(target, endpoint_base)?;
+    let app = target.app_dir.clone();
+    let path = target.product_path();
     let mut doc = read_product(&path)?;
     let ours = doc_is_ours(&doc);
     let changed = patch_doc(&mut doc, endpoint_base);
 
-    // ① 闸门：写成 `http://…` 会让**未打补丁**的 TraeWork 启动即崩（见模块文档），
+    // ① 闸门：写成 `http://…` 会让**未打补丁**的应用启动即崩（见模块文档），
     //    所以这里必须先模拟它自己的 pattern 拼接规则，不通过就绝不落盘。
     if changed {
         if let Some((raw, pattern)) = first_bad_pattern_mode(&doc, patched) {
             crate::journal::append(
                 dir,
                 "install_blocked",
-                &format!("已阻止改写：{raw} 会被 TraeWork 拼成非法 URL pattern（{pattern}），会导致它启动即崩"),
+                &format!(
+                    "已阻止对「{}」的改写：{raw} 会被它拼成非法 URL pattern（{pattern}），会导致它启动即崩",
+                    target.id
+                ),
             );
             return Err(blocked_message(&raw, &pattern));
         }
@@ -937,7 +924,8 @@ pub fn install(dir: &Path, endpoint_base: &str) -> Result<EndpointStatus, String
     //    与其写到一半失败，不如带着可操作的提示提前返回。
     if !writable_probe(&app) {
         return Err(format!(
-            "TraeWork 安装目录不可写，无法改写端点配置。{}",
+            "「{}」的安装目录不可写，无法改写端点配置。{}",
+            target.id,
             unwritable_hint(&app)
         ));
     }
@@ -954,21 +942,20 @@ pub fn install(dir: &Path, endpoint_base: &str) -> Result<EndpointStatus, String
             dir,
             "install",
             &format!(
-                "已改写 TraeWork 端点配置（bootConfig 的模型/会话地址 + 实时通道），请求改道 {endpoint_base}"
+                "已改写「{}」的端点配置（bootConfig 的模型/会话地址 + 实时通道），请求改道 {endpoint_base}",
+                target.id
             ),
         );
     }
-    Ok(status(dir, endpoint_base))
+    Ok(status(target, dir, endpoint_base))
 }
 
-/// 还原 `product.json`（幂等）。**只处理带本助手标记的文档**，别人的改动绝不触碰。
+/// 还原某个目标的 `product.json`（幂等）。**只处理带本助手标记的文档**，
+/// 别人的改动绝不触碰。
 ///
 /// 返回是否发生了还原。
-pub fn uninstall(dir: &Path) -> Result<bool, String> {
-    let Some(app) = app_dir() else {
-        return Ok(false);
-    };
-    let path = app.join(PRODUCT_FILE);
+pub fn uninstall(target: &AppTarget, dir: &Path) -> Result<bool, String> {
+    let path = target.product_path();
     if !path.exists() {
         return Ok(false);
     }
@@ -980,58 +967,129 @@ pub fn uninstall(dir: &Path) -> Result<bool, String> {
         write_product(&path, &doc)?;
     }
     // 备份只服务于「被改写」这段时期，还原后一并清掉，保持安装目录干净
-    let _ = std::fs::remove_file(app.join(BACKUP_FILE));
-    clear_lease(dir);
-    crate::journal::append(dir, "uninstall", "已还原 TraeWork 端点配置，恢复官方直连（重启后生效）");
-    Ok(true)
-}
-
-/// 启动清扫：**只在本地反代确实不可用时**才还原，恢复 TraeWork 官方直连。
-///
-/// `keep=true` 的条件是 `takeover_enabled && 反代已在监听`——此时端点指向的端口是活的，
-/// TraeWork 启动后能正常走池化，配置应保留。除此之外一律还原，避免把 TraeWork 指向死端口。
-///
-/// 返回是否发生了还原。
-pub fn sweep(dir: &Path, keep: bool) -> bool {
-    if keep {
-        return false;
-    }
-    let Some(path) = product_path() else {
-        return false;
-    };
-    if !path.exists() {
-        return false;
-    }
-    let Ok(mut doc) = read_product(&path) else {
-        return false;
-    };
-    if !doc_is_ours(&doc) {
-        return false;
-    }
-    if !restore_doc(&mut doc) || write_product(&path, &doc).is_err() {
-        return false;
-    }
-    if let Some(app) = app_dir() {
-        let _ = std::fs::remove_file(app.join(BACKUP_FILE));
-    }
-    eprintln!("[接管] 已还原 TraeWork 端点配置（本地反代不可用）");
+    let _ = std::fs::remove_file(target.app_dir.join(BACKUP_FILE));
     clear_lease(dir);
     crate::journal::append(
         dir,
-        "sweep",
-        "启动时发现端点改写残留且本地反代不可用，已自动还原 TraeWork 官方直连",
+        "uninstall",
+        &format!("已还原「{}」的端点配置，恢复官方直连（重启后生效）", target.id),
     );
-    true
+    Ok(true)
 }
 
-/// 自愈：TraeWork 升级会整份替换 `product.json`，我们的端点改写随之丢失。
+/// 某个目标的 `product.json` 是否带我们的标记（= 我们改过它，可以精确还原）。
+pub fn is_ours(target: &AppTarget) -> bool {
+    read_product(&target.product_path())
+        .map(|d| doc_is_ours(&d))
+        .unwrap_or(false)
+}
+
+/// 把**一个**目标从「我们改写过」还原成官方直连。
 ///
-/// 返回**当前是否已就绪**（端点确已指向 `endpoint_base`）：已经就绪就不写盘；
-/// 需要时补写并记一条动态（此时必须重启 TraeWork 才生效）。调用方据此决定下次检查的间隔。
-pub fn repair(dir: &Path, endpoint_base: &str) -> bool {
-    let Some(path) = product_path() else {
-        return false;
+/// - `Ok(true)`：端点确实被还回去了（备份也清了）；
+/// - `Ok(false)`：端点本来就不在我们手上（没有标记 / 文件读不到）—— 无需动作；
+/// - `Err(())`：端点还写着我们的地址却没能还回去。**调用方绝不能在这种情况下碰它的补丁**
+///   —— 明文端点 + 未打补丁 = 让那个应用启动即崩。
+fn restore_one(dir: &Path, target: &AppTarget) -> Result<bool, ()> {
+    let path = target.product_path();
+    let Ok(mut doc) = read_product(&path) else {
+        return Ok(false);
     };
+    if !doc_is_ours(&doc) {
+        return Ok(false);
+    }
+    if !restore_doc(&mut doc) || write_product(&path, &doc).is_err() {
+        return Err(());
+    }
+    let _ = std::fs::remove_file(target.app_dir.join(BACKUP_FILE));
+    clear_lease(dir);
+    Ok(true)
+}
+
+/// 清扫：**把 `all` 里不在 `keep` 里的目标**整个放下 —— 端点回官方 + 补丁还回去。
+///
+/// - `keep` = 此刻**应当保持接管**的目标集合（= 用户的接管名单）。它们不在这里出现，
+///   就说明用户不再要它们了（刚取消勾选、或上次接管留下的痕迹）。
+/// - `all` 显式传入而不是内部去 `discover()`：这样「谁该被清扫」完全由调用方决定，
+///   也为单测留出了注入合成目标的口子（真实发现会读整机应用目录，测不了）。
+/// - 为什么连补丁一起还：补丁单独留着本身无害（打过补丁的应用两种 scheme 都认），
+///   但「接管关了、应用还带着补丁」正是本助手**明确不接受**的那种「要靠人记住」的状态
+///   （见 `commands.rs` 的补丁小节）。
+/// - ⚠️ **次序是安全的一半**：只有端点**确实已经不在我们手上**时才去还原补丁
+///   （[`restore_one`] 的三种返回值正是为这件事分的）。
+///
+/// 返回被还原的端点数。
+pub fn sweep(dir: &Path, all: &[AppTarget], keep: &[AppTarget]) -> usize {
+    let mut restored = 0usize;
+    for target in all {
+        if keep.iter().any(|k| k.id == target.id) {
+            continue;
+        }
+        match restore_one(dir, target) {
+            // 端点还写着明文却没还能回去 ⇒ 绝不能碰补丁（否则那个应用下次启动即崩）
+            Err(()) => {
+                eprintln!("[接管] 「{}」的端点还原失败，跳过它的补丁处理", target.id);
+                continue;
+            }
+            Ok(true) => {
+                crate::journal::append(
+                    dir,
+                    "sweep",
+                    &format!(
+                        "「{}」的端点改写已还原为官方直连（它不在接管名单里）",
+                        target.id
+                    ),
+                );
+                restored += 1;
+            }
+            Ok(false) => {}
+        }
+        if crate::patch::is_patched(target) {
+            if let Err(e) = crate::patch::revert(dir, target) {
+                crate::journal::append(
+                    dir,
+                    "patch_revert",
+                    &format!("清理「{}」的免证书补丁失败（不影响使用）：{e}", target.id),
+                );
+            }
+        }
+    }
+    restored
+}
+
+/// 端点侧的安全网：**本地反代不在监听**时，把所有指向本机的端点还回官方（**补丁不动**）。
+///
+/// 与 [`sweep`] 的分工是刻意的：
+/// - **补丁**的生命周期跟**接管名单**走（选了就留着、没选才还回去）；
+/// - **端点**的生命周期跟**连得上**走 —— 反代没在监听时，指向它的端点就是死端口，
+///   必须立刻还回官方，否则那个应用整个不可用。
+///
+/// 为什么让两条线分开：反代没起来是个**会自愈**的瞬时状态（端口刚被占、启动竞态），
+/// 如果它连补丁也一起还回去，就会演成「还补丁 → 20 秒后重打补丁」的抖动 ——
+/// 每轮重写 2.85 MB 的 `out/main.js`。
+///
+/// 返回被还原的端点数。
+pub fn restore_endpoints(dir: &Path, all: &[AppTarget]) -> usize {
+    let mut restored = 0usize;
+    for target in all {
+        if let Ok(true) = restore_one(dir, target) {
+            crate::journal::append(
+                dir,
+                "sweep",
+                &format!("本地反代不在监听，已把「{}」的端点还原为官方直连", target.id),
+            );
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// 自愈：应用升级会整份替换 `product.json`，我们的端点改写随之丢失。
+///
+/// 返回**该目标当前是否已就绪**（端点确已指向 `endpoint_base`）：已经就绪就不写盘；
+/// 需要时补写并记一条动态（此时必须重启该应用才生效）。调用方据此决定下次检查的间隔。
+pub fn repair(target: &AppTarget, dir: &Path, endpoint_base: &str) -> bool {
+    let path = target.product_path();
     let Ok(doc) = read_product(&path) else {
         return false;
     };
@@ -1039,180 +1097,38 @@ pub fn repair(dir: &Path, endpoint_base: &str) -> bool {
         return true;
     }
     let was_ours = doc_is_ours(&doc);
-    if install(dir, endpoint_base).is_err() {
+    if install(target, dir, endpoint_base).is_err() {
         return false;
     }
     if !was_ours {
-        // 升级后配置被整份换掉：明确告诉用户「要重启 TraeWork 才生效」
+        // 升级后配置被整份换掉：明确告诉用户「要重启这个应用才生效」
         crate::journal::append(
             dir,
             "install",
-            "TraeWork 升级后端点配置被覆盖，已自动重新改写（重启 TraeWork 后生效）",
+            &format!(
+                "「{}」升级后端点配置被覆盖，已自动重新改写（重启该应用后生效）",
+                target.id
+            ),
         );
     }
     true
 }
 
 // ---------------------------------------------------------------------------
-// TraeWork 进程控制：端点配置只在 **启动时** 被读取，故改完必须重启才生效
+// 进程控制已搬去 `crate::target`
+//
+// 「这个应用在不在跑 / 怎么让它退出、再拉起来」是关于**应用**的事实，与「怎么改写它的
+// `product.json`」无关，而且现在**按目标**工作（改一个应用不该重启另一个）。
+// 所以 `is_trae_running` / `quit_graceful` / `relaunch` / `with_trae_restart` 这一组
+// 都在 `crate::target` 里，署名也从「TraeWork」改成了「某个目标」。
+//
+// ⚠️ 唯一要记住的不变量（原本就在这里，现在在 `target::with_restart` 的实现里）：
+// **端点配置只在应用启动时被读取** ⇒ 改完必须重启那个应用才生效；
+// 而 `op` 无论成败都要把应用拉回来 —— 它被闸门挡住时应用已经被我们关掉了。
 // ---------------------------------------------------------------------------
 
-/// 候选 TraeWork 进程映像名（Windows `tasklist` 中的 ImageName）。
-/// 刻意不包含本助手自身，避免误判。
-#[cfg(target_os = "windows")]
-fn trae_process_names() -> &'static [&'static str] {
-    &[
-        "TRAE SOLO CN.exe",
-        "TRAE CN.exe",
-        "Trae CN.exe",
-        "TRAE.exe",
-        "Trae.exe",
-    ]
-}
+// 进程控制见 `crate::target`：`AppTarget::running` / `quit_graceful` / `relaunch` / `with_restart`。
 
-/// TraeWork 当前是否在运行。
-///
-/// - Windows：`tasklist` 列举进程，匹配已知映像名；
-/// - macOS：`pgrep -f` 匹配各候选 app 的 bundle 路径（`.app` 后缀），避免误匹配本助手。
-pub fn is_trae_running() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        let out = std::process::Command::new("tasklist")
-            .args(["/fo", "csv", "/nh"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output();
-        if let Ok(o) = out {
-            let text = String::from_utf8_lossy(&o.stdout).to_lowercase();
-            return trae_process_names()
-                .iter()
-                .any(|n| text.contains(&n.to_lowercase()));
-        }
-        return false;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let pattern = app_names()
-            .iter()
-            .map(|n| format!("{n}.app"))
-            .collect::<Vec<_>>()
-            .join("|");
-        std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(&pattern)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        false
-    }
-}
-
-/// 轮询等待 TraeWork 完全退出，直到 `timeout_ms` 毫秒。
-pub fn wait_for_exit(timeout_ms: u64) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    while std::time::Instant::now() < deadline {
-        if !is_trae_running() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    !is_trae_running()
-}
-
-/// 请求 TraeWork 退出并等待其结束。
-///
-/// Windows 用 `taskkill /im <exe> /t` 且**刻意不加 `/f`**：TraeWork 是编辑器，强杀可能丢失
-/// 未保存内容；不带 `/f` 时系统向窗口投递关闭消息，由应用自行保存退出。全部退出返回 `true`。
-pub fn quit_graceful() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        for name in trae_process_names() {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/im", name, "/t"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for name in app_names() {
-            let _ = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(format!("tell application {:?} to quit", name))
-                .output();
-        }
-    }
-    wait_for_exit(20_000)
-}
-
-/// 重新启动 TraeWork（macOS: `open -a`；Windows: 启动已知安装目录下的 exe）。
-///
-/// ⚠️ `spawn()` 之后**必须立刻返回，绝不能 `wait()`**：`wait()` 会阻塞到 TraeWork 进程退出
-/// 为止（可能数小时），一旦被同步命令调用就会把执行线程彻底占死——这正是历史「助手卡死」的根因。
-pub fn relaunch() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local) = dirs::data_local_dir() {
-            let programs = local.join("Programs");
-            for app in app_names() {
-                let exe = programs.join(app).join(format!("{app}.exe"));
-                if exe.exists()
-                    && std::process::Command::new(&exe)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .is_ok()
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for name in app_names() {
-            if std::process::Command::new("open")
-                .arg("-a")
-                .arg(name)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// 在「TraeWork 运行中则先退出」的前提下执行 `op`，执行完再把它拉起来。
-///
-/// 返回 `(op 结果, 是否曾运行)`；未运行则只执行 `op`，不触碰进程。
-pub fn with_trae_restart<T>(op: impl FnOnce() -> Result<T, String>) -> Result<(T, bool), String> {
-    let was_running = is_trae_running();
-    if was_running && !quit_graceful() {
-        return Err("已发起退出请求，但 TraeWork 未在限时内退出，请手动关闭后重试。".into());
-    }
-    let out = op();
-    // 不管 op 成败都要把它拉回来：`op` 被闸门挡住时 TraeWork 已经被我们关掉了，
-    // 不能因为返回 Err 就把它留在关闭状态（2026-09-14 实测踩过这个坑）。
-    if was_running {
-        let _ = relaunch();
-    }
-    Ok((out?, was_running))
-}
 
 #[cfg(test)]
 mod tests {
@@ -1447,25 +1363,64 @@ mod tests {
         assert_eq!(first_prefixed(&v, "http"), None);
     }
 
-    /// 真实环境冒烟：定位本机 TraeWork 安装目录并解析原始上游域名。
+    /// 真实环境冒烟：逐个目标定位安装目录并解析原始上游域名。
     /// 需显式运行：`cargo test --lib -- --ignored`（无安装时应跳过而非失败）。
     #[test]
     #[ignore]
     fn smoke_reads_real_product_json() {
-        let Some(app) = app_dir() else {
-            eprintln!("[smoke] 本机未找到 TraeWork 安装目录，跳过");
+        let targets = crate::target::discover();
+        if targets.is_empty() {
+            eprintln!("[smoke] 本机未发现可接管的 Trae 应用，跳过");
             return;
-        };
-        eprintln!("[smoke] app_dir = {}", app.display());
+        }
         let (http, ws) = read_upstreams();
+        for target in &targets {
+            let (h, w) = upstreams_of(target);
+            eprintln!(
+                "[smoke] {} | app_dir = {} | product.json = {} | upstream http = {h:?} ws = {w:?}",
+                target.id,
+                target.app_dir.display(),
+                target.product_path().display()
+            );
+        }
         eprintln!("[smoke] upstream http = {http:?}");
         eprintln!("[smoke] upstream ws   = {ws:?}");
-        assert!(http.is_some(), "应能从 product.json 解析出 HTTP 上游");
+        assert!(http.is_some(), "应能从某个 product.json 解析出 HTTP 上游");
         assert!(
             http.unwrap().starts_with("http"),
             "HTTP 上游必须是 http(s) 地址"
         );
-        eprintln!("[smoke] product.json = {:?}", product_path());
+    }
+
+    /// 两个应用的配置**都在我们手上**时，上游域名仍必须解得出来 ——
+    /// 这时文件里只有本机地址，只能靠标记里记的原值。反代自环的防线就在这里。
+    #[test]
+    fn upstream_survives_even_when_every_target_is_rewritten() {
+        let base = std::env::temp_dir().join(format!("twa-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let targets: Vec<AppTarget> = ["TRAE SOLO CN", "Trae CN"]
+            .iter()
+            .map(|id| {
+                let app_dir = base.join(id).join("Resources/app");
+                std::fs::create_dir_all(&app_dir).unwrap();
+                let t = AppTarget {
+                    id: (*id).to_string(),
+                    bundle: base.join(id),
+                    app_dir,
+                };
+                let mut doc = product_stub();
+                patch_doc(&mut doc, LOCAL_PLAIN);
+                std::fs::write(t.product_path(), serde_json::to_string(&doc).unwrap()).unwrap();
+                t
+            })
+            .collect();
+
+        for t in &targets {
+            let (http, ws) = upstreams_of(t);
+            assert_eq!(http.as_deref(), Some("https://trae-api-cn.mchost.guru"));
+            assert_eq!(ws.as_deref(), Some("wss://trae-ws-cn.mchost.guru/custom_model"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // -----------------------------------------------------------------------
@@ -1598,46 +1553,149 @@ mod tests {
 
     #[test]
     fn preflight_is_read_only_on_this_machine() {
-        let Some(app) = app_dir() else {
-            return; // 没装 TraeWork 的机器直接跳过
-        };
-        let path = app.join(PRODUCT_FILE);
-        let Ok(before) = std::fs::read(&path) else {
-            return;
-        };
-        let backup_before = app.join(BACKUP_FILE).exists();
+        for target in crate::target::discover() {
+            let path = target.product_path();
+            let Ok(before) = std::fs::read(&path) else {
+                continue;
+            };
+            let backup_before = target.app_dir.join(BACKUP_FILE).exists();
 
-        // 预检必须是**只读**的：允许通过，但绝不允许碰 product.json，
-        // 也不允许留下/删掉备份文件。
-        let https = preflight(LOCAL);
-        let plain = preflight(&base_url(8788));
+            // 预检必须是**只读**的：允许通过，但绝不允许碰 product.json，
+            // 也不允许留下/删掉备份文件。
+            let https = preflight(&target, LOCAL);
+            let plain = preflight(&target, &base_url(8788));
 
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "预检必须是只读的，绝不允许碰 product.json"
-        );
-        assert_eq!(
-            app.join(BACKUP_FILE).exists(),
-            backup_before,
-            "预检不该留下/删掉备份文件"
-        );
-        assert!(
-            https.is_ok(),
-            "https:// 端点应当始终能过预检（它不受补丁状态约束）：{:?}",
-            https.err()
-        );
-        // 明文端点（我们现在唯一会写的那个）能不能过，取决于**当前**补丁状态 ——
-        // 这正是那条双向不变量
-        if crate::patch::is_patched() {
-            assert!(
-                plain.is_ok(),
-                "已打免证书补丁的机器上，明文端点必须能过预检：{:?}",
-                plain.err()
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "预检必须是只读的，绝不允许碰 product.json（{}）",
+                target.id
             );
-        } else {
-            let err = plain.expect_err("未打补丁时必须拦下明文端点");
-            assert!(err.contains("免证书补丁"), "错误信息要自带出路：{err}");
+            assert_eq!(
+                target.app_dir.join(BACKUP_FILE).exists(),
+                backup_before,
+                "预检不该留下/删掉备份文件（{}）",
+                target.id
+            );
+            assert!(
+                https.is_ok(),
+                "https:// 端点应当始终能过预检（它不受补丁状态约束）：{:?}",
+                https.err()
+            );
+            // 明文端点（我们现在唯一会写的那个）能不能过，取决于**这个目标**当前的补丁状态
+            // —— 这正是那条双向不变量。补丁是「一个应用一份」的，所以判断也必须按目标做。
+            if crate::patch::is_patched(&target) {
+                assert!(
+                    plain.is_ok(),
+                    "「{}」已打免证书补丁，明文端点必须能过预检：{:?}",
+                    target.id,
+                    plain.err()
+                );
+            } else {
+                let err = plain.expect_err("未打补丁时必须拦下明文端点");
+                assert!(err.contains("免证书补丁"), "错误信息要自带出路：{err}");
+                assert!(
+                    err.contains(&target.id),
+                    "错误信息必须点名是哪个应用（用户可能装了好几个）：{err}"
+                );
+            }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 多目标清扫：`keep` 之外的目标必须被还原，且**次序**不能反
+    // -----------------------------------------------------------------------
+
+    /// 造一个「我们改写过 + 打过补丁」的目标（真文件，落在临时目录里）。
+    fn rewritten_target(base: &Path, id: &str) -> AppTarget {
+        let app_dir = base.join(id).join("Contents/Resources/app");
+        std::fs::create_dir_all(app_dir.join("out")).unwrap();
+        let target = AppTarget {
+            id: id.to_string(),
+            bundle: base.join(id),
+            app_dir,
+        };
+        let mut doc = product_stub();
+        patch_doc(&mut doc, LOCAL_PLAIN);
+        std::fs::write(target.product_path(), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        std::fs::write(target.main_js_path(), crate::patch::sample_main_js()).unwrap();
+        target
+    }
+
+    #[test]
+    fn sweep_restores_only_the_targets_that_are_not_kept() {
+        let base = std::env::temp_dir().join(format!("twa-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let kept = rewritten_target(&base, "TRAE SOLO CN");
+        let dropped = rewritten_target(&base, "Trae CN");
+        assert!(crate::patch::apply(&data, &kept).unwrap().patched);
+        assert!(crate::patch::apply(&data, &dropped).unwrap().patched);
+
+        let all = vec![kept.clone(), dropped.clone()];
+        assert_eq!(sweep(&data, &all, &[kept.clone()]), 1, "只该还原不在 keep 里的那一个");
+
+        // ① 保留的那个：端点改写与补丁都原样在
+        let kept_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(kept.product_path()).unwrap()).unwrap();
+        assert!(doc_is_ours(&kept_doc), "keep 里的目标不该被动");
+        assert!(crate::patch::is_patched(&kept), "keep 里的目标补丁必须留着");
+
+        // ② 被放下的那个：端点回到官方原值、标记与备份都没了、补丁也还回去了
+        let dropped_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(dropped.product_path()).unwrap()).unwrap();
+        assert!(!doc_is_ours(&dropped_doc), "标记必须被摘掉");
+        assert_eq!(
+            dropped_doc["bootConfig"]["remote"]["trae"]["normal"],
+            "https://trae-api-cn.mchost.guru",
+            "端点必须回到官方上游"
+        );
+        assert_eq!(
+            dropped_doc["bootConfig"]["ws"]["trae"]["normal"],
+            "wss://trae-ws-cn.mchost.guru/custom_model",
+            "ws 也要精确还原（含原路径）"
+        );
+        assert!(!dropped.app_dir.join(BACKUP_FILE).exists());
+        assert!(
+            !crate::patch::is_patched(&dropped),
+            "端点已经不指向本机 ⇒ 补丁必须一并还回去"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dropped.main_js_path()).unwrap(),
+            crate::patch::sample_main_js(),
+            "补丁还原必须逐字节回到原样"
+        );
+
+        // 幂等：同样的 keep 再扫一遍，什么也不该动
+        assert_eq!(sweep(&data, &all, &[kept.clone()]), 0);
+
+        // 把 keep 也清掉 ⇒ 连它一起放下（端点 + 补丁）：`keep` 是唯一的判据
+        assert_eq!(sweep(&data, &all, &[]), 1);
+        let kept_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(kept.product_path()).unwrap()).unwrap();
+        assert!(!doc_is_ours(&kept_doc));
+        assert!(!crate::patch::is_patched(&kept));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 别人的改写（没有我们的标记）一律不碰 —— 包括**它自己的补丁**。
+    #[test]
+    fn sweep_never_touches_a_foreign_rewrite() {
+        let base = std::env::temp_dir().join(format!("twa-sweep-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let t = rewritten_target(&base, "Trae CN");
+        // 把标记摘掉、端点留成本机地址 —— 模拟「别人改的，只是恰好长得像」
+        let mut doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(t.product_path()).unwrap()).unwrap();
+        doc.as_object_mut().unwrap().remove(MARKER_KEY);
+        let foreign = serde_json::to_string_pretty(&doc).unwrap();
+        std::fs::write(t.product_path(), &foreign).unwrap();
+
+        assert_eq!(sweep(&data, &[t.clone()], &[]), 0);
+        assert_eq!(std::fs::read_to_string(t.product_path()).unwrap(), foreign);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

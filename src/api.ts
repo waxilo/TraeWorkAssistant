@@ -40,6 +40,15 @@ export const openExternal = (url: string) => invoke<void>("open_external", { url
 export const getTakeoverStatus = () => invoke<TakeoverStatus>("takeover_status");
 export const enableTakeover = () => invoke<TakeoverStatus>("takeover_enable");
 export const disableTakeover = () => invoke<TakeoverStatus>("takeover_disable");
+/**
+ * 改「接管哪些应用」——**开关开着时也能改**（命令存在的全部理由）。
+ *
+ * `ids` 语义与界面一致：**空数组 = 全部**（与「参与扣费的账号」同一套），非空 = 只接管这些。
+ * 已开启时后端做**增量协调**：新勾上的补丁 + 改道并重启它，取消的还原并重启它，
+ * 没变的应用一个字节都不碰；未开启时只记设置。
+ */
+export const setTakeoverApps = (ids: string[]) =>
+  invoke<TakeoverStatus>("takeover_set_apps", { ids });
 /** 接管动态（最新在前）：谁用了哪个账号、有没有限流换号、代理是否报错 */
 export const takeoverEvents = () => invoke<JournalEvent[]>("takeover_events");
 export const clearTakeoverEvents = () => invoke<void>("clear_takeover_events");

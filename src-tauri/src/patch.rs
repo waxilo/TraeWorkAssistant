@@ -29,6 +29,17 @@
 //! 反代既没东西可换，**不在白名单里的透传路径还会因为缺 `Authorization` 直接 401**。
 //! 结果是「看着能跑、实际全废」的**假成功** —— 比直接报错更难查。
 //!
+//! ## 一个应用一份补丁、一份指纹
+//!
+//! 本机可能同时装着几个 Trae shell（`TRAE SOLO CN` / `Trae CN`），每个都有自己的
+//! `out/main.js`。所以本模块的每个操作都**显式带 [`AppTarget`]**，指纹记录也**按目标分文件**
+//! （`patch_main_js.<id>.json`）—— 共用一个文件名会让两个应用互相覆盖对方的指纹，
+//! 还原时的 sha256 自证就会拿 A 的原始指纹去比 B 的文件，直接把「还原」变成死路。
+//!
+//! 旧版本只在助手数据目录里写过**一个** `patch_main_js.json`。它**照旧能被读到**：
+//! 记录里本来就存了 `target`（那一份 `out/main.js` 的绝对路径），只有路径吻合才用它
+//! 做自证（见 [`read_record`]）—— 于是升级上来的机器不用重打补丁也能正常还原。
+//!
 //! ## 安全边界
 //!
 //! - 补丁后闸门变成 `includes("://")`：`https://` 与 `http://` **都**能过
@@ -37,15 +48,14 @@
 //!   还原后还会比对 sha256 自证。
 //! - **fail-closed**：闸门匹配数 ≠ 2 或 pattern 数组找不到 ⇒ 拒绝打补丁，绝不半打。
 //! - 只动 `out/main.js`（`product.json.checksums` 的 14 项里**没有**它，
-//!   且它自身不引用 `checksums`）。**绝不动渲染层的 14 个受校验文件。**
+//!   且它自身不引用 `checksums`）。**绝不动渲染层的受校验文件。**
 
+use crate::target::AppTarget;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// 闸门所在的文件（相对 TraeWork 的 `Resources/app/`）。
-const MAIN_JS_REL: &str = "out/main.js";
 /// 文件尾标记：**检测与还原都靠它**，不依赖 2.85 MB 的备份。
 const MARKER: &str = "//[twa-gate v1]";
 /// 闸门必须恰好出现这么多次（`ug` 收集器 + `solo-lite-response-cors`）。
@@ -90,8 +100,9 @@ const AX_AFTER: &str =
 /// 补丁状态（只读探测结果）。
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct PatchStatus {
-    /// 找到 TraeWork 的 `out/main.js` 了吗（找不到 = 本机不支持）。
+    /// 找到这个应用的 `out/main.js` 了吗（找不到 = 这份补丁不适用于它）。
     pub supported: bool,
+    /// 被改的目标文件（`out/main.js` 的绝对路径）。
     pub target: Option<String>,
     /// 目标文件可写吗。
     pub writable: bool,
@@ -107,23 +118,82 @@ pub struct PatchStatus {
     pub message: String,
 }
 
-/// `Resources/app/out/main.js` 的路径。
-pub fn main_js_path() -> Option<PathBuf> {
-    crate::endpoint::app_dir().map(|d| d.join(MAIN_JS_REL))
+/// 只读探测某个目标的补丁状态。
+pub fn status(target: &AppTarget) -> PatchStatus {
+    let path = target.main_js_path();
+    if !path.exists() {
+        return PatchStatus {
+            target: Some(path.display().to_string()),
+            message: format!(
+                "在「{}」里没找到 out/main.js，本助手无法给它打免证书补丁。",
+                target.id
+            ),
+            ..Default::default()
+        };
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return PatchStatus {
+            target: Some(path.display().to_string()),
+            message: format!(
+                "读取「{}」的 out/main.js 失败（权限）。请检查「系统设置 → 隐私与安全性 → App 管理」。",
+                target.id
+            ),
+            ..Default::default()
+        };
+    };
+
+    let after = gates_after(&text);
+    let before = gates_before(&text);
+    let marker = has_marker(&text);
+    let id_after = has_ax(&text, AX_AFTER);
+    let id_before = has_ax(&text, AX_BEFORE);
+
+    let patched = marker && after == GATE_WANT;
+    let recognized = (before == GATE_WANT && id_before) || (after == GATE_WANT && id_after);
+    let writable = crate::endpoint::is_writable_file(&path);
+    let app = &target.id;
+
+    let message = if patched && recognized {
+        format!("「{app}」已打「免证书补丁」：端点可用明文 http://，无需安装证书。")
+    } else if recognized && !writable {
+        // 「能打」和「打得成」是两件事：版本认了但写不进去（TCC）时，如果说「可以打」，
+        // 界面上就会演成「按钮能点、点了必失败」—— 所以这里就把不可写说出去。
+        format!(
+            "「{app}」的版本已识别（闸门 {before} 处，本助手认识这个版本），但它的安装目录不可写——{}",
+            crate::endpoint::unwritable_hint(&path)
+        )
+    } else if recognized {
+        format!(
+            "「{app}」未打补丁（识别正常：闸门 {before} 处 / 身份头数组在位），可以打。\
+             打完即可用明文 http:// 端点，不再需要证书。"
+        )
+    } else if patched {
+        format!(
+            "「{app}」检测到补丁标记，但闸门形态与预期不符——可能只打了一半，建议先还原再重来。"
+        )
+    } else {
+        format!(
+            "「{app}」版本未被识别（闸门扫到 {before} 处，期望 {GATE_WANT} 处）——\
+             上游改过这段代码，本助手**拒绝**给这个应用打补丁（以免把它弄坏）。\
+             请先不接管它，或等本助手适配该版本。"
+        )
+    };
+
+    PatchStatus {
+        supported: true,
+        target: Some(path.display().to_string()),
+        writable,
+        patched,
+        recognized,
+        gates: if after == GATE_WANT { after } else { before },
+        identity_patterns: id_after || id_before,
+        message,
+    }
 }
 
-fn read_main_js() -> Result<(PathBuf, String), String> {
-    let p = main_js_path().ok_or_else(|| {
-        "未找到 TraeWork 安装目录，无法定位 out/main.js —— 本机不支持「免证书模式」。".to_string()
-    })?;
-    let text = std::fs::read_to_string(&p).map_err(|e| {
-        format!(
-            "读取 TraeWork 主进程文件失败（{}）：{e}。\
-             若 TraeWork 装在系统「应用程序」里，请在「系统设置 → 隐私与安全性 → App 管理」中允许本助手。",
-            p.display()
-        )
-    })?;
-    Ok((p, text))
+/// 某个目标当前是否已打补丁（供 `endpoint::preflight` 的不变量使用）。
+pub fn is_patched(target: &AppTarget) -> bool {
+    status(target).patched
 }
 
 /// 已打补丁的闸门处数（只统计**三个变量名一致**的真匹配）。
@@ -155,85 +225,6 @@ fn has_ax(text: &str, needle: &str) -> bool {
     text.contains(needle)
 }
 
-/// 只读探测当前状态。
-pub fn status() -> PatchStatus {
-    let Some(path) = main_js_path() else {
-        return PatchStatus {
-            supported: false,
-            message: "未找到 TraeWork 安装目录，本机无法使用「免证书模式」。".into(),
-            ..Default::default()
-        };
-    };
-    let target = Some(path.display().to_string());
-    if !path.exists() {
-        return PatchStatus {
-            supported: false,
-            target,
-            message: "未找到 TraeWork 的 out/main.js，本机无法使用「免证书模式」。".into(),
-            ..Default::default()
-        };
-    }
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return PatchStatus {
-            supported: false,
-            target,
-            message: "读取 out/main.js 失败（权限）。请检查「系统设置 → 隐私与安全性 → App 管理」。".into(),
-            ..Default::default()
-        };
-    };
-
-    let after = gates_after(&text);
-    let before = gates_before(&text);
-    let marker = has_marker(&text);
-    let id_after = has_ax(&text, AX_AFTER);
-    let id_before = has_ax(&text, AX_BEFORE);
-
-    let patched = marker && after == GATE_WANT;
-    let recognized = (before == GATE_WANT && id_before) || (after == GATE_WANT && id_after);
-    let writable = crate::endpoint::is_writable_file(&path);
-
-    let message = if patched && recognized {
-        "TraeWork 已打「免证书补丁」：端点可用明文 http://，无需安装证书。".to_string()
-    } else if recognized && !writable {
-        // 「能打」和「打得成」是两件事：版本认了但写不进去（TCC）时，如果说「可以打」，
-        // 界面上就会演成「按钮能点、点了必失败」—— 所以这里就把不可写说出去。
-        format!(
-            "TraeWork 版本已识别（闸门 {before} 处，本助手认识这个版本），但它的安装目录不可写——\
-             {}",
-            crate::endpoint::unwritable_hint(&path)
-        )
-    } else if recognized {
-        format!(
-            "TraeWork 未打补丁（识别正常：闸门 {before} 处 / 身份头数组在位），可以打。\
-             打完即可用明文 http:// 端点，不再需要证书。"
-        )
-    } else if patched {
-        "检测到补丁标记，但闸门形态与预期不符——可能只打了一半，建议「还原补丁」后重来。".to_string()
-    } else {
-        format!(
-            "TraeWork 版本未被识别（闸门扫到 {before} 处，期望 {GATE_WANT} 处）——\
-             上游改过这段代码，本助手**拒绝**打补丁（以免把 TraeWork 弄坏）。\
-             请改用 https 端点（需装证书），或等本助手适配该版本。"
-        )
-    };
-
-    PatchStatus {
-        supported: true,
-        target,
-        writable,
-        patched,
-        recognized,
-        gates: if after == GATE_WANT { after } else { before },
-        identity_patterns: id_after || id_before,
-        message,
-    }
-}
-
-/// 当前是否已打补丁（供 `endpoint::preflight` 的不变量使用）。
-pub fn is_patched() -> bool {
-    status().patched
-}
-
 // ---------------------------------------------------------------------------
 // 纯文本变换（可单测，不碰文件系统）
 // ---------------------------------------------------------------------------
@@ -251,7 +242,7 @@ fn patch_text(text: &str) -> Result<String, String> {
     let before = gates_before(text);
     if before != GATE_WANT {
         return Err(format!(
-            "拒绝打补丁：TraeWork 闸门匹配到 {before} 处，期望 {GATE_WANT} 处。\
+            "拒绝打补丁：闸门匹配到 {before} 处，期望 {GATE_WANT} 处。\
              上游版本变过，本助手不认识这个版本 —— 不猜、不改。"
         ));
     }
@@ -293,7 +284,7 @@ fn unpatch_text(text: &str) -> Result<String, String> {
     if after != GATE_WANT {
         return Err(format!(
             "拒绝还原：补丁后的闸门匹配到 {after} 处，期望 {GATE_WANT} 处。\
-             TraeWork 可能已升级（文件被整份换过），此时无需还原。"
+             应用可能已升级（文件被整份换过），此时无需还原。"
         ));
     }
     let mut out = GATE_AFTER
@@ -330,13 +321,36 @@ fn unpatch_text(text: &str) -> Result<String, String> {
 #[derive(Serialize, Deserialize, Debug)]
 struct Record {
     schema: u32,
+    /// 被改的文件的绝对路径 —— 也是「这条记录还配不配得上现在这个目标」的判据。
     target: String,
+    /// 旧版记录里没有这个字段（那时只有一个目标），所以必须能缺省。
+    #[serde(default)]
+    app_id: String,
     orig_len: usize,
     orig_sha256: String,
     applied_at: String,
 }
 
-fn record_path(dir: &Path) -> PathBuf {
+/// 目标 id → 文件名安全片段。
+///
+/// 名字里可能有空格、中文、斜杠，直接拼进文件名会出事；而「只做替换」又会让
+/// 两个不同的 id 撞成同一个文件名（互相覆盖指纹）。所以是「净化 + id 的哈希尾巴」。
+fn slug(id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let safe = safe.trim_matches('-');
+    let safe = if safe.is_empty() { "app" } else { safe };
+    format!("{safe}-{}", &sha256_hex(id)[..8])
+}
+
+fn record_path(dir: &Path, target: &AppTarget) -> PathBuf {
+    dir.join(format!("patch_main_js.{}.json", slug(&target.id)))
+}
+
+/// 旧版的**单目标**记录文件（升级用户的机器上还留着它）。
+fn legacy_record_path(dir: &Path) -> PathBuf {
     dir.join(RECORD_FILE)
 }
 
@@ -346,23 +360,42 @@ fn sha256_hex(s: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn write_record(dir: &Path, target: &Path, orig: &str) {
+fn write_record(dir: &Path, target: &AppTarget, orig: &str) {
     let rec = Record {
         schema: RECORD_SCHEMA,
-        target: target.display().to_string(),
+        target: target.main_js_path().display().to_string(),
+        app_id: target.id.clone(),
         orig_len: orig.len(),
         orig_sha256: sha256_hex(orig),
         applied_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     };
     if let Ok(text) = serde_json::to_string_pretty(&rec) {
-        let _ = std::fs::write(record_path(dir), text);
+        let _ = std::fs::write(record_path(dir, target), text);
     }
 }
 
-fn read_record(dir: &Path) -> Option<Record> {
-    let text = std::fs::read_to_string(record_path(dir)).ok()?;
-    let rec: Record = serde_json::from_str(&text).ok()?;
-    (rec.schema == RECORD_SCHEMA).then_some(rec)
+/// 读该目标的指纹记录：先看按目标分的那份，再回落到旧版的单目标记录
+/// —— 后者只有 `target` 路径**确实指着这个应用**时才认（否则会拿 B 的原始指纹去比 A 的文件）。
+fn read_record(dir: &Path, target: &AppTarget) -> Option<Record> {
+    let mine = target.main_js_path().display().to_string();
+    let parse = |p: PathBuf| -> Option<Record> {
+        let text = std::fs::read_to_string(p).ok()?;
+        let rec: Record = serde_json::from_str(&text).ok()?;
+        (rec.schema == RECORD_SCHEMA && rec.target == mine).then_some(rec)
+    };
+    parse(record_path(dir, target)).or_else(|| parse(legacy_record_path(dir)))
+}
+
+/// 删掉该目标的记录；顺带把**旧版那份**（若确实属于它）一并清掉，
+/// 免得留着一条已经过期的指纹在下次还原时跳出来自证。
+fn remove_record(dir: &Path, target: &AppTarget) {
+    let _ = std::fs::remove_file(record_path(dir, target));
+    let mine = target.main_js_path().display().to_string();
+    if let Ok(text) = std::fs::read_to_string(legacy_record_path(dir)) {
+        if serde_json::from_str::<Record>(&text).map(|r| r.target == mine).unwrap_or(false) {
+            let _ = std::fs::remove_file(legacy_record_path(dir));
+        }
+    }
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
@@ -378,40 +411,46 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 // 对外操作
 // ---------------------------------------------------------------------------
 
-/// 打补丁（幂等）。已打过则直接返回当前状态。
-pub fn apply(dir: &Path) -> Result<PatchStatus, String> {
-    let (path, text) = read_main_js()?;
-    let st = status();
+/// 给一个目标打补丁（幂等）。已打过则直接返回当前状态。
+pub fn apply(dir: &Path, target: &AppTarget) -> Result<PatchStatus, String> {
+    let path = target.main_js_path();
+    let st = status(target);
     if st.patched {
         return Ok(st);
+    }
+    if !st.supported {
+        return Err(st.message);
     }
     if !st.recognized {
         return Err(st.message);
     }
     if !st.writable {
         return Err(format!(
-            "TraeWork 的 out/main.js 写不进去——{}",
+            "「{}」的 out/main.js 写不进去——{}",
+            target.id,
             crate::endpoint::unwritable_hint(&path)
         ));
     }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取 out/main.js 失败：{e}"))?;
 
     let patched = patch_text(&text)?;
     write_atomic(&path, &patched)?;
-    write_record(dir, &path, &text);
+    write_record(dir, target, &text);
     crate::journal::append(
         dir,
         "patch_apply",
-        "已给 TraeWork 打「免证书补丁」（闸门接受 http:// + 身份头规则覆盖明文端点），\
-         此后端点可用明文，无需安装证书",
+        &format!(
+            "已给「{}」打「免证书补丁」（闸门接受 http:// + 身份头规则覆盖明文端点），\
+             此后端点可用明文，无需安装证书",
+            target.id
+        ),
     );
-    Ok(status())
+    Ok(status(target))
 }
 
-/// 还原补丁（幂等）。返回是否发生了改动。
-pub fn revert(dir: &Path) -> Result<bool, String> {
-    let Some(path) = main_js_path() else {
-        return Ok(false);
-    };
+/// 还原某个目标的补丁（幂等）。返回是否发生了改动。
+pub fn revert(dir: &Path, target: &AppTarget) -> Result<bool, String> {
+    let path = target.main_js_path();
     if !path.exists() {
         return Ok(false);
     }
@@ -419,39 +458,49 @@ pub fn revert(dir: &Path) -> Result<bool, String> {
         // 没有标记 = 我们没碰过（或已被升级覆盖），**原样留着**
         return Ok(false);
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取 out/main.js 失败：{e}"))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取 out/main.js 失败：{e}"))?;
     let restored = unpatch_text(&text)?;
 
     // 有指纹记录 ⇒ 还原后用 sha256 自证；对不上就不写，如实报告
-    if let Some(rec) = read_record(dir) {
-        if rec.target == path.display().to_string() {
-            let got = sha256_hex(&restored);
-            if got != rec.orig_sha256 {
-                return Err(format!(
-                    "还原后的文件与记录的原始指纹不一致（期望 {}…，实得 {}…），\
-                     为避免写入可疑内容，本次**未做任何改动**。\
-                     若 TraeWork 已升级，当前文件本身就是新的，无需还原。",
-                    &rec.orig_sha256[..12.min(rec.orig_sha256.len())],
-                    &got[..12.min(got.len())]
-                ));
-            }
+    if let Some(rec) = read_record(dir, target) {
+        let got = sha256_hex(&restored);
+        if got != rec.orig_sha256 {
+            return Err(format!(
+                "「{}」还原后的文件与记录的原始指纹不一致（期望 {}…，实得 {}…），\
+                 为避免写入可疑内容，本次**未做任何改动**。\
+                 若应用已升级，当前文件本身就是新的，无需还原。",
+                target.id,
+                &rec.orig_sha256[..12.min(rec.orig_sha256.len())],
+                &got[..12.min(got.len())]
+            ));
         }
     }
 
     write_atomic(&path, &restored)?;
-    let _ = std::fs::remove_file(record_path(dir));
+    remove_record(dir, target);
     crate::journal::append(
         dir,
         "patch_revert",
-        "已还原 TraeWork 主进程补丁，闸门恢复成「只认 https」的原始行为",
+        &format!(
+            "已还原「{}」的主进程补丁，闸门恢复成「只认 https」的原始行为",
+            target.id
+        ),
     );
     Ok(true)
 }
 
-// ---------------------------------------------------------------------------
-// 测试
-// ---------------------------------------------------------------------------
+/// 测试用：一段与 `out/main.js` 同构的最小样本（两个闸门 + 身份头数组）。
+///
+/// 别的模块（`endpoint` 的清扫测试）也要造一个「已打补丁的应用」，与其各写一份、日后
+/// 上游改版时只改了一处，不如从这里取。
+#[cfg(test)]
+pub fn sample_main_js() -> String {
+    let a = r#"const u=l.startsWith("https://")?`${l}/*`:`https://${l}/*`;"#;
+    let b = r#"forEach(c=>{const p=c.startsWith("https://")?`${c}/*`:`https://${c}/*`;r.push(p)});"#;
+    let c = r#"aX=["https://*/trae/*","wss://*/explorer/*","ws://*/explorer/*"],cX=[".trae.cn"];"#;
+    format!("{a}\n{b}\n{c}\n")
+}
 
 #[cfg(test)]
 mod tests {
@@ -459,10 +508,17 @@ mod tests {
 
     /// 一段与 `out/main.js` 同构的最小样本（两个闸门 + 身份头数组）。
     fn sample() -> String {
-        let a = r#"const u=l.startsWith("https://")?`${l}/*`:`https://${l}/*`;"#;
-        let b = r#"forEach(c=>{const p=c.startsWith("https://")?`${c}/*`:`https://${c}/*`;r.push(p)});"#;
-        let c = r#"aX=["https://*/trae/*","wss://*/explorer/*","ws://*/explorer/*"],cX=[".trae.cn"];"#;
-        format!("{a}\n{b}\n{c}\n")
+        sample_main_js()
+    }
+
+    fn fake_target(dir: &Path, id: &str) -> AppTarget {
+        let app_dir = dir.join(format!("{id}.app")).join("Contents/Resources/app");
+        std::fs::create_dir_all(app_dir.join("out")).unwrap();
+        AppTarget {
+            id: id.to_string(),
+            bundle: dir.join(format!("{id}.app")),
+            app_dir,
+        }
     }
 
     #[test]
@@ -511,7 +567,7 @@ r=["https://*.traeapi.us/*","https://*/trae/*","wss://*/explorer/*","ws://*/expl
 
     #[test]
     fn mismatched_variable_names_do_not_count() {
-        // `${l}` / `${c}` 混用 ⇒ 不是 TraeWork 的真实形态，不能算一处理匹配
+        // `${l}` / `${c}` 混用 ⇒ 不是真实形态，不能算一处理匹配
         let src = r#"const u=l.startsWith("https://")?`${c}/*`:`https://${l}/*`;"#;
         assert_eq!(gates_before(src), 0);
     }
@@ -530,55 +586,136 @@ r=["https://*.traeapi.us/*","https://*/trae/*","wss://*/explorer/*","ws://*/expl
         assert_eq!(unpatch_text(&patched).unwrap(), src);
     }
 
-    /// 真机只读扫描：确认本机 TraeWork 版本**被识别**，且闸门恰好 2 处。
-    ///
-    /// 这个测试是「上游改版」的第一道预警 —— 它不需要 `--ignored`，但会跳过
-    /// 找不到 TraeWork 的环境，所以可以长期留着。
+    /// 指纹文件名：可读 + 唯一。
     #[test]
-    fn real_main_js_is_recognized_on_this_machine() {
-        let Some(path) = main_js_path() else {
-            eprintln!("跳过：本机未找到 TraeWork");
-            return;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("跳过：{} 读不到", path.display());
-            return;
-        };
-        let before = gates_before(&text);
-        let after = gates_after(&text);
-        let id_before = has_ax(&text, AX_BEFORE);
-        let id_after = has_ax(&text, AX_AFTER);
-        eprintln!(
-            "main.js {} bytes | 闸门前 {before} / 后 {after} | 身份头数组 前 {id_before} / 后 {id_after} | 标记 {}",
-            text.len(),
-            has_marker(&text)
+    fn record_file_names_are_readable_and_unique() {
+        assert!(slug("TRAE SOLO CN").starts_with("TRAE-SOLO-CN-"));
+        assert!(slug("Trae CN").starts_with("Trae-CN-"));
+        assert_ne!(slug("Trae CN"), slug("TRAE CN"));
+        // 纯中文 / 纯符号也不会退化成空名或互相撞车
+        assert_ne!(slug("某应用"), slug("另一应用"));
+        assert!(slug("///").starts_with("app-"));
+    }
+
+    /// 端到端（真临时目录）：打补丁 → 还原，逐字节回到原样，且指纹只在磁盘上按目标分开。
+    #[test]
+    fn apply_then_revert_round_trips_on_disk_per_target() {
+        let base = std::env::temp_dir().join(format!("twa-patch-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let a = fake_target(&base, "TRAE SOLO CN");
+        let b = fake_target(&base, "Trae CN");
+        let src = sample();
+        for t in [&a, &b] {
+            std::fs::write(t.main_js_path(), &src).unwrap();
+        }
+
+        // 两个应用都打上补丁：各自的指纹必须落在各自的文件里
+        for t in [&a, &b] {
+            let st = apply(&data, t).expect("打补丁失败");
+            assert!(st.patched, "{}", st.message);
+            assert!(st.recognized, "{}", st.message);
+        }
+        let ra = record_path(&data, &a);
+        let rb = record_path(&data, &b);
+        assert!(ra.exists() && rb.exists(), "指纹必须按目标分开存");
+        assert_ne!(ra, rb);
+        assert!(!data.join(RECORD_FILE).exists(), "新版不再写那份旧的单目标指纹");
+
+        // 还原：两边回到逐字节原样，指纹被清掉
+        for t in [&a, &b] {
+            assert!(revert(&data, t).expect("还原失败"));
+            assert_eq!(std::fs::read_to_string(t.main_js_path()).unwrap(), src);
+            assert!(!record_path(&data, t).exists());
+        }
+        assert!(!revert(&data, &a).unwrap(), "没有标记 ⇒ 幂等空操作");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 升级用户的机器上留着**旧版**的单目标指纹：只要它的 `target` 指着这个应用的
+    /// `out/main.js`，就得照旧参与还原自证 —— 否则「还原」会退化成无自证写盘。
+    #[test]
+    fn a_legacy_single_record_is_still_used_for_the_matching_app() {
+        let base = std::env::temp_dir().join(format!("twa-patch-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let a = fake_target(&base, "TRAE SOLO CN");
+        let b = fake_target(&base, "Trae CN");
+        let src = sample();
+        std::fs::write(a.main_js_path(), &src).unwrap();
+        std::fs::write(b.main_js_path(), &src).unwrap();
+
+        // 手写一份旧版记录：schema=1、没有 app_id，target 指着 A
+        let legacy = format!(
+            r#"{{"schema":1,"target":{:?},"orig_len":{},"orig_sha256":{},"applied_at":"t"}}"#,
+            a.main_js_path().display().to_string(),
+            src.len(),
+            serde_json::to_string(&sha256_hex(&src)).unwrap()
+        );
+        std::fs::write(legacy_record_path(&data), legacy).unwrap();
+
+        assert_eq!(
+            read_record(&data, &a).map(|r| r.orig_sha256),
+            Some(sha256_hex(&src)),
+            "旧记录属于 A 时必须被 A 用到"
         );
         assert!(
-            (before == GATE_WANT && id_before) || (after == GATE_WANT && id_after),
-            "本机 TraeWork 版本未被识别：闸门前 {before} / 后 {after}；\
-             若上游改版，请更新 patch.rs 的正则后再打补丁"
+            read_record(&data, &b).is_none(),
+            "旧记录不能拿去给 B 自证（会把还原变成死路）"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 真机只读扫描：本机**每个**被发现的应用都要被识别（闸门恰好 2 处 + 身份头数组在位）。
+    ///
+    /// 这是「上游改版」的第一道预警，也是多目标改造的验收点：
+    /// `Trae CN` 以前根本没机会走到这里，现在必须和 SOLO 一样通过。
+    #[test]
+    fn real_main_js_is_recognized_on_this_machine() {
+        let targets = crate::target::discover();
+        if targets.is_empty() {
+            eprintln!("跳过：本机未发现可接管的 Trae 应用");
+            return;
+        }
+        for t in &targets {
+            let st = status(t);
+            eprintln!(
+                "[{}] supported={} patched={} recognized={} gates={} identity_patterns={}",
+                t.id, st.supported, st.patched, st.recognized, st.gates, st.identity_patterns
+            );
+            assert!(
+                st.recognized,
+                "「{}」未被识别：{}；若上游改版，请更新 patch.rs 的正则后再打补丁",
+                t.id, st.message
+            );
+        }
     }
 
     /// 敏感操作前的只读演练：把真文件读进来在**内存里**打一遍再还原，不写盘。
     #[test]
     fn real_main_js_roundtrips_in_memory() {
-        let Some(path) = main_js_path() else {
-            eprintln!("跳过：本机未找到 TraeWork");
-            return;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("跳过：{} 读不到", path.display());
-            return;
-        };
-        if gates_before(&text) != GATE_WANT {
-            // 已打过补丁的机器
-            let back = unpatch_text(&text).expect("已打补丁的文件必须能还原");
-            assert_eq!(gates_before(&back), GATE_WANT);
+        let targets = crate::target::discover();
+        if targets.is_empty() {
+            eprintln!("跳过：本机未发现可接管的 Trae 应用");
             return;
         }
-        let patched = patch_text(&text).expect("本机版本应可打补丁");
-        assert_eq!(gates_after(&patched), GATE_WANT);
-        assert_eq!(sha256_hex(&unpatch_text(&patched).unwrap()), sha256_hex(&text));
+        for t in &targets {
+            let Ok(text) = std::fs::read_to_string(t.main_js_path()) else {
+                eprintln!("跳过「{}」：out/main.js 读不到", t.id);
+                continue;
+            };
+            if gates_before(&text) != GATE_WANT {
+                // 已打过补丁
+                let back = unpatch_text(&text).expect("已打补丁的文件必须能还原");
+                assert_eq!(gates_before(&back), GATE_WANT);
+                continue;
+            }
+            let patched = patch_text(&text).expect("本机版本应可打补丁");
+            assert_eq!(gates_after(&patched), GATE_WANT);
+            assert_eq!(sha256_hex(&unpatch_text(&patched).unwrap()), sha256_hex(&text));
+            eprintln!("[{}] 内存往返一致 ✓", t.id);
+        }
     }
 }

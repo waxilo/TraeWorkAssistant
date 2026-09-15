@@ -76,22 +76,62 @@ pub struct Backup {
 // 路径
 // ---------------------------------------------------------------------------
 
-/// TraeWork 的 userData 目录名 —— 从 `product.json` 的 `nameShort` 读，不硬编码。
-///
-/// Electron 的 `app.getPath('userData')` 默认就是 `Application Support/<app.getName()>`，
-/// 而这个应用的 `package.json.name` 正是 `TRAE SOLO CN`。读 `nameShort` 是为了将来
-/// 应用改名（或出别的区域版）时不用改代码。
-fn user_data_dir() -> Option<PathBuf> {
-    let name = crate::endpoint::app_dir()
-        .and_then(|app| std::fs::read_to_string(app.join("product.json")).ok())
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("nameShort").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| "TRAE SOLO CN".to_string());
-    Some(dirs::home_dir()?.join("Library/Application Support").join(name))
+/// Electron 的应用数据基目录（与 `app.getPath('userData')` 的父目录一致）。
+fn app_support_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs::data_dir() // %APPDATA%
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dirs::home_dir().map(|h| h.join("Library/Application Support"))
+    }
 }
 
-pub fn settings_path() -> Option<PathBuf> {
-    Some(user_data_dir()?.join(SETTINGS_REL))
+/// TraeWork 的 userData 目录名 —— 从 `product.json` 的 `nameShort` 读，不硬编码。
+///
+/// Electron 的 `app.getPath('userData')` 默认就是 `<app support>/<app.getName()>`，
+/// 而这个应用的 `package.json.name` 正是 `nameShort`。读它而不是写死，是为了将来
+/// 应用改名（或出别的区域版）时不用改代码。
+///
+/// ⚠️ **一个应用一份目录**：本机可能同时装着 `TRAE SOLO CN` 与 `Trae CN`（两个 shell、
+/// 两个 userData 目录）。旧版「经系统代理接管」往哪一份里写过是未知的，所以清理时
+/// **每一份都要看** —— 只看默认目标会让另一个应用带着「指向本机回环」的代理设置
+/// 一直断网（详见 [`uninstall`]）。
+fn user_data_dir_of(target: &crate::target::AppTarget) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(target.product_path()).ok()?;
+    let name = serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("nameShort")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())?;
+    Some(app_support_dir()?.join(name))
+}
+
+/// 本机**所有**可能被旧版本写过代理设置的用户数据目录。
+pub fn user_data_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for t in crate::target::discover() {
+        if let Some(d) = user_data_dir_of(&t) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    if out.is_empty() {
+        // 兜底：一个目标都没发现时（应用已卸载/正在升级），仍然按历史上那个目录名找一遍
+        // —— 痕迹留在磁盘上，不会因为应用不在了就消失。
+        if let Some(base) = app_support_dir() {
+            out.push(base.join("TRAE SOLO CN"));
+        }
+    }
+    out
+}
+
+/// 所有候选的 `User/settings.json` 路径。
+pub fn settings_paths() -> Vec<PathBuf> {
+    user_data_dirs().into_iter().map(|d| d.join(SETTINGS_REL)).collect()
 }
 
 fn backup_path(data_dir: &Path) -> PathBuf {
@@ -214,45 +254,61 @@ fn clear_ours(doc: &mut Value) -> bool {
 /// 而开关已经关掉、代理已经停止 —— 它指着的是一个没人接的端口，表现是**整个应用断网**。
 ///
 /// 所以没有备份时走 [`clear_ours`]：只在三个键**确实指向本机回环**时才清掉，
-/// 让它回到 TraeWork 自己的默认（system）。
+/// 让它回到应用自己的默认（system）。
+///
+/// **多目标**：本机所有 Trae 应用的 userData 都过一遍（见 [`user_data_dirs`]）——
+/// 旧版本往哪一份里写过是未知的，漏掉一个就等于把它永久留在断网状态。
 pub fn uninstall(data_dir: &Path) -> Result<String, String> {
-    let path = settings_path().ok_or_else(|| "找不到 TraeWork 的用户数据目录".to_string())?;
-    let mut doc = read_doc(&path)?;
-    let Some(bak) = read_backup(data_dir) else {
+    let paths = settings_paths();
+    if paths.is_empty() {
+        return Err("找不到 TraeWork 的用户数据目录".to_string());
+    }
+    let mut notes: Vec<String> = Vec::new();
+    for path in paths {
+        notes.push(uninstall_one(data_dir, &path)?);
+    }
+    Ok(notes.join("；"))
+}
+
+/// 处理**一份** `User/settings.json`。文件不存在时是空操作（返回一句「无需还原」）。
+fn uninstall_one(data_dir: &Path, path: &Path) -> Result<String, String> {
+    let mut doc = read_doc(path)?;
+    // 备份是**单个**文件，且记着它当时改的是哪个文件 ⇒ 只有路径对得上才算数。
+    let bak = read_backup(data_dir).filter(|b| b.path == path.display().to_string());
+    let Some(bak) = bak else {
         let changed = clear_ours(&mut doc);
         if changed {
-            write_doc(&path, &doc)?;
+            write_doc(path, &doc)?;
         }
         return Ok(if changed {
             format!(
-                "没有备份，但 {} 里的代理键仍指向本机 —— 已清掉，TraeWork 回到自带的默认代理设置",
+                "没有备份，但 {} 里的代理键仍指向本机 —— 已清掉，该应用回到自带的默认代理设置",
                 path.display()
             )
         } else {
-            format!("没有备份，{} 里也没有残留的本机代理设置，无需还原", path.display())
+            format!("{} 里没有残留的本机代理设置，无需还原", path.display())
         });
     };
     let changed = restore(&mut doc, &bak.keys);
     if changed {
-        write_doc(&path, &doc)?;
+        write_doc(path, &doc)?;
     }
     let _ = std::fs::remove_file(backup_path(data_dir));
     Ok(format!(
-        "已还原 TraeWork 的用户设置（{}；改动 {}）",
+        "已还原 {}（改动 {}）",
         path.display(),
         if changed { "有" } else { "无" }
     ))
 }
 
-/// 当前 TraeWork 是否正走（旧版本设置过的）本机代理 —— 决定要不要清扫。
+/// 本机**任一** Trae 应用当前是否正走（旧版本设置过的）本机代理 —— 决定要不要清扫。
 ///
-/// 不需要 `data_dir`：判据全在 TraeWork 自己的 `User/settings.json` 里，而那个路径由
-/// `product.json` 推导（见 [`settings_path`]）。曾经收过 `data_dir` 却根本没用上。
+/// 不需要 `data_dir`：判据全在各应用自己的 `User/settings.json` 里，而那个路径由
+/// 各自的 `product.json` 推导（见 [`settings_paths`]）。曾经收过 `data_dir` 却根本没用上。
 pub fn applied(port: u16) -> bool {
-    let Some(p) = settings_path() else {
-        return false;
-    };
-    read_doc(&p).map(|d| is_applied(&d, port)).unwrap_or(false)
+    settings_paths()
+        .iter()
+        .any(|p| read_doc(p).map(|d| is_applied(&d, port)).unwrap_or(false))
 }
 
 #[cfg(test)]

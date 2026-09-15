@@ -16,6 +16,7 @@ mod proxy;
 mod renew;
 mod rules;
 mod scheduler;
+mod target;
 mod token;
 mod trae_auth;
 mod traework;
@@ -72,8 +73,7 @@ pub fn run() {
             scheduler::spawn(app.handle().clone());
             renew::spawn(app.handle().clone());
             proxy::spawn_proxy(app.handle().clone());
-            // 启动清扫：等反代有机会绑定端口后，判断是否需要恢复 TraeWork 端点配置。
-            // 只保留「接管开启且反代确实在监听」这一种情形，其余一律恢复官方直连。
+            // 启动清扫：等反代有机会绑定端口后，判断需要保留哪些应用的端点改写。
             let heal_app = app.handle().clone();
             std::thread::spawn(move || {
                 for _ in 0..12 {
@@ -87,16 +87,33 @@ pub fn run() {
                                 std::thread::sleep(std::time::Duration::from_millis(100));
                             }
                         }
-                        // 端点改写的唯一保留条件：**接管开着 且 反代确实在监听**。
-                        // 其余一律恢复官方直连 —— 端点指向一个没人接的端口，是整应用不可用。
-                        let keep = s.takeover_enabled && proxy::status().active;
-                        let _ = endpoint::sweep(&d, keep);
+                        let all = target::discover();
+                        let proxy_ok = proxy::status().active;
+
+                        // ① 「该接管谁」完全由**开关 + 名单**决定：开关关着、或不在名单里 ⇒
+                        //    整个放下（端点回官方 + 补丁还回去）。启动时做这一遍，能兜住
+                        //    「上次退出时正改到一半」以及「有人直接改了 settings.json」。
+                        let keep: Vec<target::AppTarget> = if s.takeover_enabled {
+                            target::select(&s.takeover_apps)
+                        } else {
+                            Vec::new()
+                        };
+                        let _ = endpoint::sweep(&d, &all, &keep);
+
+                        // ② 开关开着、但反代没能起来 ⇒ 端点必须立刻还回官方（否则应用指着死端口，
+                        //    等于整个不可用），**补丁留着** —— 反代起不来是瞬时状态，把补丁也还回去
+                        //    会让自愈变成「还补丁 → 20s 后重打补丁」的抖动。
+                        if s.takeover_enabled && !proxy_ok {
+                            endpoint::restore_endpoints(&d, &all);
+                        }
+
                         // ⚠️ 反向清扫**不能因为「经系统代理接管」已被移除就删掉**。
                         // 那条路在**用户机器上**留的痕迹不会自己消失：老版本可能把 TraeWork 的
                         // `User/settings.json` 指到了本机回环代理，而新版的反代不再做正向代理
                         // （明文 CONNECT 一律 405），那个设置留着 = TraeWork 整应用不可用。
                         // 所以每次启动都确认一遍：只要它还指着本机回环，就清掉。
-                        // `uninstall` 按**回环指纹**判定，绝不碰用户自己配的非回环代理。
+                        // `uninstall` 按**回环指纹**判定，绝不碰用户自己配的非回环代理；
+                        // 它现在会**逐个应用**检查各自的数据目录（见 `traework::user_data_dirs`）。
                         if traework::applied(s.takeover_port) {
                             if let Ok(msg) = traework::uninstall(&d) {
                                 let _ = journal::append(&d, "legacy_proxy_clear", &msg);
@@ -138,6 +155,7 @@ pub fn run() {
             commands::takeover_status,
             commands::takeover_enable,
             commands::takeover_disable,
+            commands::takeover_set_apps,
             commands::takeover_rules,
             commands::takeover_save_rules,
             commands::takeover_events,

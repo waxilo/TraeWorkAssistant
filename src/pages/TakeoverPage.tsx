@@ -3,33 +3,39 @@ import {
   getTakeoverStatus,
   enableTakeover,
   disableTakeover,
+  setTakeoverApps,
   takeoverEvents,
   clearTakeoverEvents,
 } from "../api";
-import type { Account, JournalEvent, TakeoverStatus, Settings } from "../types";
+import type { Account, AppStatus, JournalEvent, TakeoverStatus, Settings } from "../types";
 import { mmdd } from "../format";
 import Switch from "../components/Switch";
 
 /**
  * 智能接管页。
  *
- * 设计取向：**一个开关管到底**，其余控件都只在「它此刻真的挡着路」时出现。
+ * 设计取向：**一个开关 + 两张勾选表**，其余控件都只在「它此刻真的挡着路」时出现。
  *
- * - 改道方式**只有一种：端点改写**（把 TraeWork 安装目录里 `product.json` 的
- *   `bootConfig` 指向 `http://127.0.0.1:PORT`），端点恒为**明文回环、不需要任何证书**。
+ * - 改道方式**只有一种：端点改写**（把应用安装目录里 `product.json` 的 `bootConfig`
+ *   指向 `http://127.0.0.1:PORT`），端点恒为**明文回环、不需要任何证书**。
  *   曾经的「经系统代理接管」与「端点讲 https + 自签 CA」两条路已整体移除 —— 界面上
  *   因此不再有「改道方式 / 端点模式」这类选择，也没有证书安装/移除。
- * - **TraeWork 补丁的生命周期完全跟着开关走**，所以界面上一行都不给：
- *   开接管时后端自动打（`enable_endpoint` 第 0 步）、关接管时后端自动还原（与端点还原
- *   合并在同一次重启里）。留一个「还原补丁」按钮只会多出一个「忘了点」的状态。
- *   唯一仍要在这里说的是**打不成的时候** —— 那正是开关灰着的理由（见 `problem`）。
+ * - **接管哪些应用**：本机可能同时装了多个 Trae shell（如 `TRAE SOLO CN` + `Trae CN`），
+ *   所以「接管对象」是一个**多选**（`接管应用` 那一行）。语义与「参与扣费」完全一致：
+ *   **一个都不勾 = 全部接管**，取消勾选 = 只有勾上的被改道、被重启。
+ *   ⚠️ 多选**只在真的多于一个应用时**才有交互（只有一个时那枚 chip 是只读的 ——
+ *   全不选会被后端解释成「全部」，点它想说的事根本表达不出来）。
+ * - **补丁的生命周期完全跟着选择走**：勾上时后端自动打（开接管第 0 步 / `set_apps` 的增量步）、
+ *   取消时后端自动还原（与端点还原合并在同一次重启里）。留一个「还原补丁」按钮只会多出
+ *   一个「忘了点」的状态。唯一仍要在这里说的是**打不成的时候** —— 那正是开关灰着的理由。
  * - 开关是唯一的「开着吗」，接管动态是唯一的「刚才发生了什么」，所以「已生效 / 未生效 /
  *   直连官方 / 处理中」这类复述型标签全部去掉。
  * - **接管动态每次打开本页都从空开始**（`clearTakeoverEvents` —— 用户要求）：它回答的是
  *   「这次打开之后发生了什么」，不是历史档案。想留档就趁页面开着别走。
  * - 选号规则、上游地址这类实现细节不进界面 —— 排障看「接管动态」与
  *   `proxy-rules.json`（后者刻意做成热加载：真机对账时要能不重编译地调）。
- * - 文字只在**有东西挡住你**时出现（见 `problem`）：不正常才是需要解释的时刻。
+ * - 文字只在**有东西挡住你**时出现（见 `issue`）：不正常才是需要解释的时刻，
+ *   而且是**按应用**各说各的 —— 合成一句话必然要说谎。
  */
 interface Props {
   settings: Settings | null;
@@ -59,14 +65,14 @@ function eventKind(e: JournalEvent): { label: string; cls: Kind } {
       return { label: "关闭接管", cls: "off" };
     case "sweep":
       return { label: "自动恢复", cls: "off" };
-    // 旧版本的「经系统代理接管」在 TraeWork 的 `User/settings.json` 里留过回环代理痕迹。
+    // 旧版本的「经系统代理接管」在应用的 `User/settings.json` 里留过回环代理痕迹。
     // 那条路已整体移除（本端点对 CONNECT 一律 405），痕迹留着 = 整应用不可用，
     // 所以每次开机与关接管都会确认清一遍 —— 清干净了也要在这里留个痕，证明它被处理过。
     case "legacy_proxy_clear":
       return { label: "清理旧版痕迹", cls: "off" };
     case "restart_trae":
-      return { label: "重启 TraeWork", cls: "restart" };
-    // 补丁由开关自动打/还原，但这两条记录**必须留着**：它是「TraeWork 被改过没有」的唯一实证。
+      return { label: "重启应用", cls: "restart" };
+    // 补丁由开关/选择自动打与还原，但这两条记录**必须留着**：它是「应用被改过没有」的唯一实证。
     // 还原失败时也落在这两条上（detail 里写明），所以标签只描述动作、不预判成败。
     case "patch_apply":
       return { label: "打补丁", cls: "on" };
@@ -130,6 +136,36 @@ function shortLabel(a: Account): string {
   return a.name.length > 6 ? a.name.slice(0, 6) : a.name;
 }
 
+/**
+ * 单个应用的健康灯。只在**接管开着**时才渲染（关着时它必然全灰，是噪声）：
+ * - `ok`   = 端点已由本助手改道到本机，且它的补丁在位；
+ * - `warn` = 这个应用有事（后端给了 `message`），或改道丢了 / 不是本助手改的。
+ */
+function appHealth(a: AppStatus, enabled: boolean): "ok" | "warn" | "idle" {
+  if (!a.selected || !enabled) return "idle";
+  if (a.message) return "warn";
+  return a.installed && a.ours && a.patch.patched ? "ok" : "warn";
+}
+
+/** chip 的悬停提示：在改谁、改到哪、有没有问题 —— 排障时要能一眼看到这几样。 */
+function appTitle(a: AppStatus, enabled: boolean, multi: boolean): string {
+  const parts: string[] = [a.bundle];
+  if (a.app_dir && a.app_dir !== a.bundle) parts.push(`目录 ${a.app_dir}`);
+  if (a.message) {
+    parts.push(a.message);
+  } else if (!a.selected) {
+    parts.push("未接管");
+  } else if (!enabled) {
+    parts.push("接管未开启，勾选只决定下次开启时改谁");
+  } else {
+    parts.push(a.installed && a.ours ? "端点已改道本机" : "尚未改道");
+  }
+  if (a.upstream_http) parts.push(`上游 ${a.upstream_http}`);
+  if (a.running) parts.push("正在运行");
+  if (multi) parts.push("点击切换是否接管");
+  return parts.join(" · ");
+}
+
 function TakeoverPage({ settings, update, notify, accounts }: Props) {
   const port = settings?.takeover_port ?? 8788;
   const [st, setSt] = useState<TakeoverStatus | null>(null);
@@ -177,50 +213,89 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
   }, [load]);
 
   const enabled = !!settings?.takeover_enabled;
+
+  /** 本机发现到的**全部**应用（没勾的也在里面 —— 多选的前提就是能看见它们）。 */
+  const apps = st?.apps ?? [];
+  const appIds = useMemo(() => new Set(apps.map((a) => a.id)), [apps]);
+  const multi = apps.length > 1;
+
   /**
-   * 「生效中」= 开关开着、反代真在监听、且 `product.json` 的改写还在。
+   * 接管名单。
+   *
+   * **空列表 = 全部**（与后端 `target::select` 一致，也是「没配置过」的默认状态），
+   * 所以界面上把空列表渲染成「全部勾选」；用户一动就把显式列表写进设置。
+   * 「全不选」被禁止：那会写回空列表，后端又会退回「全部」，与「没勾的不接管」正好相反。
+   * 本机已不存在的 id 在后端会被丢掉，这里也过滤一遍，免得设置里留一条永远勾不亮的名字。
+   */
+  const picked = useMemo(
+    () => (settings?.takeover_apps ?? []).filter((id) => appIds.has(id)),
+    [settings, appIds]
+  );
+  const appOn = useCallback((id: string) => picked.length === 0 || picked.includes(id), [picked]);
+  /** 真正在名单里的应用 —— 判据与展示都用它，别在两处各算一遍（必然分叉）。 */
+  const active = useMemo(() => apps.filter((a) => appOn(a.id)), [apps, appOn]);
+
+  /**
+   * 「生效中」= 开关开着、反代真在监听、且**至少一个**在名单里的应用端点还被改着。
    * 三者缺一都不算生效（应用升级会悄悄把 product.json 换回去）。
    */
-  const live = enabled && !!st?.proxy_active && !!st?.installed;
-  /**
-   * 免证书补丁**打得成**吗 —— 它现在是**开关能不能打开**的唯一判据（开接管会自动打）。
-   * 打不成只有两种成因：版本不认识 / 安装目录不可写（macOS「App 管理」TCC）。
-   */
-  const patchReady = !!st?.patch.recognized && !!st?.patch.writable;
+  const live = enabled && !!st?.proxy_active && active.some((a) => a.installed);
 
   /**
-   * 页面上唯一的文字出口。只在「有东西挡住你 / 坏了」时给一句，且一次只说最要紧的那条。
-   *
-   * 前置条件（补丁 / 端口 / 目录不可写）后端分得最清，直接用它的那句 `message`，
-   * 不要在这里重写话术——两份必然分叉，而边界恰恰是「补丁没打 / 打不上」这种最容易错的地方。
-   * 唯一需要在这里补的是「一切都正常，但你还没开始省额度」——那是观察模式。
+   * 开接管会给名单里的应用**逐个**打补丁，任何一个打不成整次开启都会失败（后端回滚已打的）
+   * ⇒ 开关能不能点的判据是「名单里**每个**应用都打得成」，不是「至少一个」。
    */
-  const problem = useMemo(() => {
-    if (error) return error;
-    if (!st) return null;
-    if (!st.supported) return "没有找到 TraeWork 安装目录，本机无法开启接管。";
-    // 开关此刻灰着 ⇒ 必须说清「为什么开不了」。这一条必须排在前面，
-    // 否则会出现「按钮是灰的、页面上一句话都没有」——比报错更难排查。
-    // 补丁探针的话术自带处置办法（版本不认识 / 不可写 + 怎么办），直接用它的。
-    if (!enabled && !patchReady) return st.message;
-    if (st.installed && !st.ours) {
-      return "TraeWork 的端点已指向本机反代，但不是本助手改的——为免误伤，助手不会动它。";
-    }
-    if (enabled && !st.proxy_active) {
-      return st.proxy_error ? `本地反代没有在监听：${st.proxy_error}` : "本地反代没有在监听。";
-    }
-    if (enabled && st.rules?.observe_only) {
-      return "当前是**观察模式**：流量已全部经过本机，但一个凭据都还没换——把 proxy-rules.json 的 observe_only 改成 false 才会真正走账号池。";
-    }
-    return null;
-  }, [error, st, enabled, patchReady]);
+  const blocked = useMemo(
+    () => active.filter((a) => !(a.patch.recognized && a.patch.writable)),
+    [active]
+  );
+  const patchReady = active.length > 0 && blocked.length === 0;
 
   /**
-   * 参与扣费的账号。
+   * 页面上唯一的文字出口。只在「有东西挡住你 / 坏了」时给内容，且**按应用**分条。
    *
-   * **空列表 = 全部**（与后端 `billing_candidates` 一致，也是「没配置过」的默认状态），
-   * 所以界面上把空列表渲染成「全部勾选」；用户一动就把显式列表写进设置。
-   * 「全不选」被禁止：那会写回空列表，后端又会退回「全部」，与「没勾的不扣费」正好相反。
+   * 为什么必须按应用分：本机可能装了两个 Trae shell，一个能接管、另一个版本不认识 ——
+   * 合成一句话必然要说谎，用户也无从知道该点掉哪一个。所以结构是
+   * 「一句总结（可选，只装全局性的事）+ 逐条明细（可选，每条都能归属到某个应用）」，
+   * 前置条件的话术（补丁 / 端口 / 不可写）直接用后端那句，不在这里重写 —— 两份必然分叉，
+   * 而边界恰恰是「补丁没打 / 打不上」这种最容易错的地方。
+   */
+  const issue = useMemo<{ text: string | null; items: string[] } | null>(() => {
+    if (!st) return error ? { text: error, items: [] } : null;
+    if (apps.length === 0) {
+      return error
+        ? { text: error, items: [] }
+        : { text: "没有找到可接管的 Trae 应用，本机无法开启接管。", items: [] };
+    }
+
+    const items: string[] = [];
+    if (st.missing_apps.length > 0) {
+      items.push(`接管名单里有本机找不到的应用，已跳过：${st.missing_apps.join("、")}`);
+    }
+    // 名单里每个应用各一句（后端只在有事时说，正常是空串）。只有一条明细时前缀是废话。
+    for (const a of active) {
+      if (a.message) items.push(multi ? `${a.label}：${a.message}` : a.message);
+    }
+
+    let text: string | null = null;
+    if (error) {
+      // 失败必须留在页面上（toast 会消失），否则开关弹回去却没说为什么
+      text = error;
+    } else if (!enabled && blocked.length > 0) {
+      // 开关此刻灰着 ⇒ 要说「怎么才能开」。原因已在明细里逐条写清了，这里只给下一步。
+      text = "取消勾选上面打不了补丁的应用，就可以接管其余应用。";
+    } else if (enabled && !st.proxy_active) {
+      text = st.proxy_error ? `本地反代没有在监听：${st.proxy_error}` : "本地反代没有在监听。";
+    } else if (enabled && st.rules?.observe_only) {
+      text =
+        "当前是观察模式：流量已全部经过本机，但一个凭据都还没换 —— 把 proxy-rules.json 的 observe_only 改成 false 才会真正走账号池。";
+    }
+    if (!text && items.length === 0) return null;
+    return { text, items };
+  }, [error, st, apps, enabled, blocked, active, multi]);
+
+  /**
+   * 参与扣费的账号。语义与「接管应用」同一套：**空 = 全部**，且禁止全不选。
    */
   const accountIds = useMemo(() => new Set(accounts.map((a) => a.id)), [accounts]);
   const billingIds = useMemo(
@@ -241,6 +316,41 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
     }
     // 全部选回 = 写空列表（后端语义就是「全部」），避免设置里留一份和默认等价的显式名单
     update({ billing_account_ids: next.length === accounts.length ? [] : next });
+  };
+
+  /**
+   * 改「接管哪些应用」。
+   *
+   * 必须走后端命令（而不是像账号那样直接写设置）：**开关开着时它要立即生效** ——
+   * 后端做增量协调（新勾的补丁 + 改道并重启、取消的还原并重启、没变的一个字节都不碰）。
+   * 开关关着时后端只记设置，那就不该说「已生效」。
+   *
+   * ⚠️ 本地选择**乐观先写**：后端在「打补丁失败」时也会把选择存下来（只回一句失败原因），
+   * 所以先写与磁盘一致；真错了也会被接下来的 `load()` 拉回来。
+   */
+  const toggleApp = async (id: string) => {
+    const current = picked.length === 0 ? apps.map((a) => a.id) : picked;
+    const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id];
+    if (next.length === 0) {
+      notify("至少保留一个应用");
+      return;
+    }
+    // 全部勾上 = 写空名单（后端语义就是「全部」），避免设置里留一份与默认等价的显式名单
+    const ids = next.length === apps.length ? [] : next;
+    setBusy(true);
+    setError(null);
+    update({ takeover_apps: ids });
+    try {
+      const r = await setTakeoverApps(ids);
+      setSt(r);
+      notify(enabled ? "接管应用已更新" : "已记录，开启接管时生效");
+    } catch (e) {
+      // 勾不上必须留在页面上：否则「勾了却没接管」会变成一个看不见的状态
+      setError(String(e));
+    } finally {
+      setBusy(false);
+      void load();
+    }
   };
 
   /**
@@ -267,9 +377,9 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
   };
 
   /**
-   * 开关。**它是唯一会动 TraeWork 的东西**，两个方向都是「打包动作」：
-   * - 开：打补丁 → 预检 → 起反代 → 改端点 → 重启 TraeWork；
-   * - 关：还原端点 → 还原补丁 → 重启 TraeWork → 停反代。
+   * 开关。**它是唯一会动别人应用的东西**，两个方向都是「打包动作」：
+   * - 开：给名单里的应用逐个打补丁 → 预检 → 起反代 → 改端点 → 重启它们；
+   * - 关：还原端点 → 还原补丁 → 重启它们 → 停反代。
    * 所以文案要说清「它会动别人的应用」，别让用户以为只是本机一个开关。
    */
   const onToggle = async (checked: boolean) => {
@@ -285,7 +395,7 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
         const r = await disableTakeover();
         setSt(r);
         update({ takeover_enabled: false });
-        notify("已恢复官方直连，TraeWork 补丁也已还原。");
+        notify("已恢复官方直连，补丁也已还原。");
       }
     } catch (e) {
       // 失败必须留在页面上（toast 会消失），否则开关弹回去却没说为什么
@@ -334,7 +444,7 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
 
   return (
     <>
-      {/* ── 控制区：一个开关 + 一个端口 + 哪些账号参与扣费。没有别的控件，也没有复述状态的文字 ── */}
+      {/* ── 控制区：一个开关 + 接管哪些应用 + 一个端口 + 哪些账号参与扣费。没有别的控件，也没有复述状态的文字 ── */}
       <section className={`card hero${live ? " live" : ""}`}>
         <div className="hero-row">
           <h2>智能接管</h2>
@@ -343,18 +453,53 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
             checked={enabled}
             disabled={
               busy ||
-              !st?.supported ||
-              // 补丁打不成 ⇒ 开接管必然失败（它第一步就是打补丁），先在能开之前灰掉。
+              apps.length === 0 ||
+              // 名单里有应用打不成补丁 ⇒ 开接管必然失败（它第一步就是逐个打补丁），
+              // 先在「能开」之前灰掉（原因与下一步见下面那张勾选表和 `issue`）。
               (!enabled && !patchReady)
             }
             title={
               enabled
-                ? "关闭接管：恢复官方直连，并还原给 TraeWork 打的免证书补丁（会重启 TraeWork）"
-                : "开启接管：给 TraeWork 打免证书补丁、把端点改到本机反代（会重启 TraeWork）"
+                ? "关闭接管：恢复官方直连，并还原给这些应用打的免证书补丁（会重启它们）"
+                : "开启接管：给勾选的应用打免证书补丁、把端点改到本机反代（会重启它们）"
             }
             onChange={(v) => onToggle(v)}
           />
         </div>
+
+        {apps.length > 0 && (
+          <div className="hero-row">
+            <span
+              className="field-label"
+              title={
+                multi
+                  ? "只接管控勾选的应用；一个都不勾 = 全部接管。开启状态下改动会立即生效（只重启受影响的应用）"
+                  : "本机只发现这一个 Trae 应用，没有选择余地"
+              }
+            >
+              接管应用
+            </span>
+            <div className="chips">
+              {apps.map((a) => {
+                const on = appOn(a.id);
+                return (
+                  <button
+                    key={a.id}
+                    className={"chip" + (on ? " on" : "") + (multi ? "" : " static")}
+                    // 只有一个应用时不给点：全不选会被后端解释成「全部」，点了也表达不出别的意思
+                    disabled={busy || !multi}
+                    title={appTitle(a, enabled, multi)}
+                    onClick={() => void toggleApp(a.id)}
+                  >
+                    {on && <span className="tick">✓</span>}
+                    {a.label}
+                    {on && enabled && <span className={"app-dot " + appHealth(a, enabled)} />}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         <div className="hero-row">
           <span className="field-label">端口</span>
@@ -401,7 +546,18 @@ function TakeoverPage({ settings, update, notify, accounts }: Props) {
           </div>
         )}
 
-        {problem && <div className="notice">{problem}</div>}
+        {issue && (
+          <div className="notice">
+            {issue.text && <div>{issue.text}</div>}
+            {issue.items.length > 0 && (
+              <ul className="notice-list">
+                {issue.items.map((t, i) => (
+                  <li key={i}>{t}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
       </section>
 
       {/* ── 接管动态：谁在什么时候用了哪个账号 / 有没有被限流换号 / 代理有没有报错。

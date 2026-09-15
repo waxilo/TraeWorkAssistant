@@ -305,6 +305,9 @@ input.port-input:disabled { background: var(--surface-2); color: var(--muted); b
 /* 「需要你动手」的那一条：右侧带一个动作按钮（本地证书是接管的硬前置条件） */
 .notice.act { display: flex; align-items: center; gap: 12px; }
 .notice.act > span { flex: 1; min-width: 0; }
+/* 按应用分条的明细（本机可能装了多个 Trae shell，一处问题归属到哪个应用必须看得见） */
+.notice-list { margin: 6px 0 0; padding-left: 1.1em; list-style: disc; }
+.notice-list li + li { margin-top: 2px; }
 
 /* 次级动作：不常按、又不该跟主开关抢注意力（装/撤本地证书） */
 .link-btn {
@@ -430,6 +433,16 @@ input.port-input:disabled { background: var(--surface-2); color: var(--muted); b
 .chip.on:hover { background: var(--primary-weak); filter: brightness(.98); }
 .chip:disabled { opacity: .55; cursor: not-allowed; }
 .chip .tick { font-size: 10.5px; }
+
+/* 「接管应用」：本机只发现一个应用时那枚 chip 是只读的 —— 它仍是**已选**状态，
+   所以不能被 `.chip:disabled` 的 55% 透明压暗（那看起来像没勾上）。 */
+.chip.static, .chip.static:hover { cursor: default; }
+.chip.static.on, .chip.static.on:hover { opacity: 1; filter: none; }
+
+/* chip 尾部的健康灯（只在接管开着时渲染）：绿 = 已改道且补丁在位，橙 = 这个应用有事 */
+.app-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--muted); }
+.app-dot.ok { background: var(--primary); }
+.app-dot.warn { background: #d97706; }
 
 /* ---------- 单元格里的第二行小字（到期时间等） ---------- */
 .sub { display: block; font-size: 11px; line-height: 1.35; color: var(--muted); font-variant-numeric: tabular-nums; }
